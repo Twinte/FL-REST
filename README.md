@@ -1,4 +1,3 @@
-````markdown
 # 🧠 Federated Learning Simulation Framework
 
 [![Docker Build](https://img.shields.io/badge/Docker-Build-blue?logo=docker)](https://www.docker.com/)

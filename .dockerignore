@@ -1,0 +1,19 @@
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Python cache
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Local data
+data/
+fl_logs/
+fl_pids.txt

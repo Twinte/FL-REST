@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-# 1. Define the STATIC header
+# 1. Define the STATIC header (REMOVED docker-tc service)
 YAML_HEADER = """
 version: '3.8'
 
@@ -10,22 +10,13 @@ x-client-template: &client-template
   volumes:
     - ./data:/app/data
     - ./fl_logs:/app/fl_logs
-    - ./config.py:/app/config.py  # <--- NEW: Live config updates
+    - ./config.py:/app/config.py
   depends_on:
     server:
       condition: service_healthy
 
 services:
-  docker-tc:
-    image: lukaszlach/docker-tc
-    container_name: docker-tc
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/docker-tc:/var/docker-tc
-    restart: always
+  # docker-tc removed
 
   server:
     build: .
@@ -45,7 +36,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./fl_logs:/app/fl_logs
-      - ./config.py:/app/config.py  # <--- NEW: Live config updates
+      - ./config.py:/app/config.py
     deploy:
       resources:
         reservations:
@@ -55,7 +46,7 @@ services:
               capabilities: [gpu]
 """
 
-# 2. Define the TEMPLATES with Network Labels
+# 2. Define the TEMPLATES (REMOVED labels section)
 
 # --- HIGH PERFORMANCE CLIENT (Fast Network) ---
 CLIENT_HIGH_PERF_TEMPLATE = """
@@ -65,10 +56,6 @@ CLIENT_HIGH_PERF_TEMPLATE = """
     environment:
       - CLIENT_ID=client_{client_id_str}
       - SERVER_URL=http://server:5000
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=1gbit"
-      - "com.docker-tc.delay=20ms"
     deploy:
       resources:
         reservations:
@@ -86,11 +73,6 @@ CLIENT_LOW_PERF_TEMPLATE = """
     environment:
       - CLIENT_ID=client_{client_id_str}
       - SERVER_URL=http://server:5000
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=5mbps"
-      - "com.docker-tc.delay=200ms"
-      - "com.docker-tc.loss=1%"
     cpus: '0.5'
     mem_limit: '512m'
 """
@@ -114,7 +96,7 @@ def generate_compose_file(num_high, num_low):
     try:
         with open('docker-compose.yml', 'w') as f:
             f.write(compose_content)
-        print(f"✅ Successfully generated 'docker-compose.yml' with {total_clients} clients.")
+        print(f"✅ Successfully generated 'docker-compose.yml' with {total_clients} clients (No Docker-TC).")
     except IOError as e:
         print(f"❌ Error writing to file: {e}")
         sys.exit(1)

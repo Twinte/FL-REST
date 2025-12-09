@@ -1,26 +1,29 @@
-# 1. Start from an official PyTorch image with CUDA support
-#    This saves us from installing PyTorch and the CUDA toolkit manually.
-#    You can change 'cu121' to your specific CUDA version (e.g., cu118)
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+# 1. Use a standard Python base image (Debian-based is reliable)
+FROM python:3.11-slim
 
-# 2. Set up the working directory inside the container
+ENV PYTHONUNBUFFERED=1
+
+# 2. Set working directory
 WORKDIR /app
 
-# 3. Set the PYTHONPATH
-#    This allows Python to find your 'client' and 'server' modules,
-#    which is crucial for imports like 'from client.model import get_model'.
+# 3. Set PYTHONPATH so python can find your modules
 ENV PYTHONPATH=/app
 
-RUN apt-get update && apt-get install -y curl
+# 4. Install system tools (curl/git are often needed)
+RUN apt-get update && apt-get install -y curl build-essential
 
-# 4. Copy and install requirements
-#    We copy *only* this file first to leverage Docker's build cache.
-#    This layer won't be rebuilt unless requirements.txt changes.
+# 5. Install PyTorch 2.9.1 with CUDA 13.0 (RTX 50 Support)
+#    We run this FIRST to ensure it's the foundation of our environment.
+#    (This matches the command from your screenshot)
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# 6. Copy and install the rest of the dependencies
+#    (Make sure you removed 'torch' from this file in Step 1!)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy all your project code into the container
+# 7. Copy the rest of your application
 COPY . .
 
-# 6. Default command (this will be overridden by docker-compose)
+# 8. Default command
 CMD ["python"]

@@ -7,8 +7,8 @@ set -e # Exit immediately if any command fails
 #################################################################
 
 # --- Client & Round Config ---
-CLIENTS_HIGH_PERF=2  # GPU + Fast Network
-CLIENTS_LOW_PERF=3   # CPU + Slow Network (Stragglers)
+CLIENTS_HIGH_PERF=5  # GPU + Fast Network
+CLIENTS_LOW_PERF=0   # CPU + Slow Network (Stragglers)
 
 TOTAL_ROUNDS=10
 MIN_CLIENTS_FOR_AGGREGATION=5
@@ -36,7 +36,7 @@ DIRICHLET_ALPHA=0.5
 CLIENT_DROPOUT_RATE=0.0
 ROUND_TIMEOUT_SEC=300
 
-# --- Network Traffic Simulation (Docker-TC) ---
+# --- Network Traffic Simulation (Application Level) ---
 SLOW_SENDER_RATE=0.0
 SLOW_SENDER_DELAY_SEC=30
 NETWORK_LATENCY_RATE=0.0
@@ -111,9 +111,9 @@ echo "✅ $CONFIG_FILE updated."
 # 3. GENERATE DOCKER-COMPOSE FILE
 #################################################################
 
-echo "🔄 Generating docker-compose.yml for $NUM_CLIENTS clients..."
+echo "🔄 Generating docker compose.yml for $NUM_CLIENTS clients..."
 python generate_compose.py --high $CLIENTS_HIGH_PERF --low $CLIENTS_LOW_PERF
-echo "✅ docker-compose.yml generated."
+echo "✅ docker compose.yml generated."
 
 
 #################################################################
@@ -121,20 +121,23 @@ echo "✅ docker-compose.yml generated."
 #################################################################
 
 echo "🧹 Cleaning up old containers..."
-docker-compose down --remove-orphans
+docker compose down --remove-orphans
+
+mkdir -p fl_logs
 
 LOG_FILE="fl_logs/simulation_$(date +'%Y%m%d_%H%M%S').log"
 
 echo "🚀 Building images..."
-docker-compose build
+docker compose build
 
 echo "📦 Preparing Data (Downloading & Partitioning)..."
-docker-compose run --rm server python prepare_data.py
+docker compose run --rm server python prepare_data.py
 
 echo "▶️ Starting Simulation..."
 echo "🪵 Log file will be saved to: $LOG_FILE"
 
-docker-compose up --remove-orphans --exit-code-from server | tee $LOG_FILE
+# NEW (Adds '2>&1')
+docker compose up --remove-orphans --exit-code-from server 2>&1 | tee $LOG_FILE
 
 echo "---"
 echo "✅ Simulation complete. Log saved to $LOG_FILE"

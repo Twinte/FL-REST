@@ -6,7 +6,7 @@ SERVER_MOMENTUM = 0.9
 DEVICE = "auto"
 TOTAL_ROUNDS = 10
 MIN_CLIENTS_PER_ROUND = 5
-MIN_CLIENTS_FOR_AGGREGATION = 5
+MIN_CLIENTS_FOR_AGGREGATION = 3
 SAVED_MODEL_NAME = "final_global_model.pth"
 
 # --- Client Algorithm (How we train locally) ---

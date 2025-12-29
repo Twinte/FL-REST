@@ -10,7 +10,7 @@ WORKDIR /app
 ENV PYTHONPATH=/app
 
 # 4. Install system tools (curl/git are often needed)
-RUN apt-get update && apt-get install -y curl build-essential
+RUN apt-get update && apt-get install -y curl build-essential iproute2
 
 # 5. Install PyTorch 2.9.1 with CUDA 13.0 (RTX 50 Support)
 #    We run this FIRST to ensure it's the foundation of our environment.

@@ -6,12 +6,17 @@ set -e # Exit immediately if any command fails
 # (Edit these values to configure your test run)
 #################################################################
 
-# --- Client & Round Config ---
-CLIENTS_HIGH_PERF=5  # GPU + Fast Network
-CLIENTS_LOW_PERF=0   # CPU + Slow Network (Stragglers)
+# --- Client Profiles ---
+CLIENTS_NORMAL=2   # GPU + Fast Network
+CLIENTS_SLOW=2     # CPU + 5mbit Bandwidth
+CLIENTS_LOSSY=1    # GPU + 5% Packet Loss
+
+# Calculate Totals
+TOTAL_CLIENTS=$(($CLIENTS_NORMAL + $CLIENTS_SLOW + $CLIENTS_LOSSY))
+MIN_CLIENTS_FOR_AGGREGATION=3
 
 TOTAL_ROUNDS=10
-MIN_CLIENTS_FOR_AGGREGATION=5
+
 
 # --- Client Training Config ---
 LOCAL_EPOCHS=3
@@ -50,7 +55,8 @@ SAVED_MODEL_NAME="final_global_model.pth"
 
 # ---------------------------------------------------------------
 # (Derived values - DO NOT EDIT)
-NUM_CLIENTS=$(($CLIENTS_HIGH_PERF + $CLIENTS_LOW_PERF))
+# We must sum up the NEW variables we defined at the top
+NUM_CLIENTS=$(($CLIENTS_NORMAL + $CLIENTS_SLOW + $CLIENTS_LOSSY))
 MIN_CLIENTS_PER_ROUND=$NUM_CLIENTS
 TOTAL_CLIENTS=$NUM_CLIENTS
 CONFIG_FILE="config.py"
@@ -111,9 +117,13 @@ echo "✅ $CONFIG_FILE updated."
 # 3. GENERATE DOCKER-COMPOSE FILE
 #################################################################
 
-echo "🔄 Generating docker compose.yml for $NUM_CLIENTS clients..."
-python generate_compose.py --high $CLIENTS_HIGH_PERF --low $CLIENTS_LOW_PERF
-echo "✅ docker compose.yml generated."
+echo "🔄 Generating docker-compose.yml..."
+python generate_compose.py \
+  --normal $CLIENTS_NORMAL \
+  --slow $CLIENTS_SLOW \
+  --lossy $CLIENTS_LOSSY
+
+echo "✅ docker-compose.yml generated."
 
 
 #################################################################

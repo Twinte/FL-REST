@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-# 1. Define the STATIC header (REMOVED docker-tc service)
+# 1. Static Header (Server + Template)
 YAML_HEADER = """
 version: '3.8'
 
@@ -14,10 +14,11 @@ x-client-template: &client-template
   depends_on:
     server:
       condition: service_healthy
+  # Enable NET_ADMIN for all clients so they can use 'tc'
+  cap_add:
+    - NET_ADMIN
 
 services:
-  # docker-tc removed
-
   server:
     build: .
     image: fl-framework
@@ -46,72 +47,99 @@ services:
               capabilities: [gpu]
 """
 
-# 2. Define the TEMPLATES (REMOVED labels section)
+# 2. Network Profiles Definition
+TC_COMMANDS = {
+    "normal": "",  # No restriction
+    "slow": "tc qdisc add dev eth0 root tbf rate 5mbit burst 32kbit latency 400ms",
+    "fast_latency": "tc qdisc add dev eth0 root netem delay 100ms 20ms", # 100ms delay ±20ms jitter
+    "lossy": "tc qdisc add dev eth0 root netem loss 5%", # 5% packet loss
+    "mobile": "tc qdisc add dev eth0 root netem delay 50ms 10ms rate 20mbit"
+}
 
-# --- HIGH PERFORMANCE CLIENT (Fast Network) ---
-CLIENT_HIGH_PERF_TEMPLATE = """
-  client_{client_id_str}:
-    <<: *client-template
-    command: python -m client.app
-    environment:
-      - CLIENT_ID=client_{client_id_str}
-      - SERVER_URL=http://server:5000
+def generate_client_service(client_id, profile="normal"):
+    client_id_str = f"{client_id:03d}"
+    tc_cmd = TC_COMMANDS.get(profile, "")
+    
+    # Construct the startup command
+    if tc_cmd:
+        # We use a shell to chain: clean old rules -> apply new rules -> start app
+        # "|| true" ensures we don't crash if no rules existed previously
+        command = (
+            f'sh -c "tc qdisc del dev eth0 root 2>/dev/null || true && '
+            f'{tc_cmd} && '
+            f'echo \'[Network] Applied profile: {profile}\' && '
+            f'python -m client.app"'
+        )
+    else:
+        command = "python -m client.app"
+
+    # Hardware resource allocation based on profile
+    # (You can customize this: e.g., 'slow' clients get less CPU)
+    if profile in ["slow", "mobile"]:
+        resources = "    cpus: '0.5'\n    mem_limit: '512m'"
+        gpu_deploy = "" # No GPU for slow devices
+    else:
+        resources = ""
+        # Give GPU to normal/lossy/fast clients
+        gpu_deploy = """
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
-"""
+              capabilities: [gpu]"""
 
-# --- LOW PERFORMANCE CLIENT (Slow Network) ---
-CLIENT_LOW_PERF_TEMPLATE = """
+    return f"""
   client_{client_id_str}:
     <<: *client-template
-    command: python -m client.app
+    command: >
+      {command}
     environment:
       - CLIENT_ID=client_{client_id_str}
       - SERVER_URL=http://server:5000
-    cpus: '0.5'
-    mem_limit: '512m'
+      - NETWORK_PROFILE={profile}
+{resources}{gpu_deploy}
 """
 
-def generate_compose_file(num_high, num_low):
+def main():
+    parser = argparse.ArgumentParser(description="Generate docker-compose with network profiles.")
+    parser.add_argument('--normal', type=int, default=0, help="Count of normal clients")
+    parser.add_argument('--slow', type=int, default=0, help="Count of slow/throttled clients")
+    parser.add_argument('--lossy', type=int, default=0, help="Count of clients with packet loss")
+    args = parser.parse_args()
+    
+    total_clients = args.normal + args.slow + args.lossy
+    if total_clients < 1:
+        print("❌ Error: Must have at least one client.")
+        sys.exit(1)
+
     compose_content = YAML_HEADER
     client_counter = 1
 
-    for _ in range(num_high):
-        client_id_str = f"{client_counter:03d}"
-        compose_content += CLIENT_HIGH_PERF_TEMPLATE.format(client_id_str=client_id_str)
+    # Generate entries for each type
+    for _ in range(args.normal):
+        compose_content += generate_client_service(client_counter, "normal")
+        client_counter += 1
+        
+    for _ in range(args.slow):
+        compose_content += generate_client_service(client_counter, "slow")
         client_counter += 1
 
-    for _ in range(num_low):
-        client_id_str = f"{client_counter:03d}"
-        compose_content += CLIENT_LOW_PERF_TEMPLATE.format(client_id_str=client_id_str)
+    for _ in range(args.lossy):
+        compose_content += generate_client_service(client_counter, "lossy")
         client_counter += 1
 
-    total_clients = num_high + num_low
-    
     try:
         with open('docker-compose.yml', 'w') as f:
             f.write(compose_content)
-        print(f"✅ Successfully generated 'docker-compose.yml' with {total_clients} clients (No Docker-TC).")
+        print(f"✅ Generated docker-compose.yml with {total_clients} clients.")
+        print(f"   - Normal: {args.normal}")
+        print(f"   - Slow:   {args.slow}")
+        print(f"   - Lossy:  {args.lossy}")
     except IOError as e:
         print(f"❌ Error writing to file: {e}")
         sys.exit(1)
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate docker-compose.")
-    parser.add_argument('--high', type=int, required=True)
-    parser.add_argument('--low', type=int, required=True)
-    args = parser.parse_args()
-    
-    if args.high < 0 or args.low < 0 or (args.high + args.low) < 1:
-        print("❌ Error: Must have at least one client.")
-        sys.exit(1)
-        
-    generate_compose_file(args.high, args.low)
 
 if __name__ == "__main__":
     main()

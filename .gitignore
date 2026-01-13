@@ -18,3 +18,12 @@ data/
 
 # macOS
 .DS_Store
+
+FEDALERT_INTEGRATION_GUIDE.md
+INSTALLATION_SUMMARY.md
+README_FEDALERT.md
+client/algorithms/fedalert_algo.py
+client/algorithms/fedalert_detector.py
+server/strategies/fedalert_strategy.py
+shared/fedalert_components.py
+test_fedalert_integration.py

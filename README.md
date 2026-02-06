@@ -1,4 +1,4 @@
-# 🧠 Federated Learning Simulation Framework
+# FL-REST - Federated Learning Simulation Framework 
 
 [![Docker Build](https://img.shields.io/badge/Docker-Build-blue?logo=docker)](https://www.docker.com/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
@@ -13,23 +13,23 @@ The entire system runs inside **Docker containers** and is orchestrated through 
 
 ---
 
-## 🚀 Features
+##  Features
 
 - **Containerized & Scalable:** Uses **Docker** and **Docker Compose** to launch the server and multiple clients as isolated containers.  
 - **Centralized Control:** A single `run.sh` script controls all simulation parameters.  
 - **Real ML Pipeline:** Implements a **PyTorch CNN** trained on **CIFAR-10** using **Federated Averaging (FedAvg)**.  
 - **Comprehensive Metrics:** Logs training time, payload size, and peak **RAM/GPU usage** for every client update.  
 - **Realistic Simulations:** Built-in support for key FL challenges:  
-  - 🧩 **Non-IID data:** Dirichlet distribution for client data heterogeneity.  
-  - ⚙️ **Hardware heterogeneity:** Simulated “High-Perf” (GPU) and “Low-Perf” (CPU-limited) clients.  
-  - ❌ **Client dropout:** Randomly removes clients mid-training.  
-  - ⏱️ **Straggler handling:** Round timeout for slow clients.  
-  - 🌐 **Network instability:** Simulates upload delays and download latency.  
+  -  **Non-IID data:** Dirichlet distribution for client data heterogeneity.  
+  -  **Hardware heterogeneity:** Simulated “High-Perf” (GPU) and “Low-Perf” (CPU-limited) clients.  
+  -  **Client dropout:** Randomly removes clients mid-training.  
+  -  **Straggler handling:** Round timeout for slow clients.  
+  -  **Network instability:** Simulates upload delays and download latency.  
 - **Graceful Shutdown:** The server automatically saves the final model and terminates all containers cleanly, storing a timestamped log.
 
 ---
 
-## 🛠️ Prerequisites
+##  Prerequisites
 
 Before running, ensure your system has:
 
@@ -44,7 +44,7 @@ Before running, ensure your system has:
 
 Run a complete simulation with just a few commands.  
 
-> 💡 **Tip:** Don’t edit `config.py` or `docker-compose.yml` manually — use `run.sh` to configure everything.
+>  **Tip:** Don’t edit `config.py` or `docker-compose.yml` manually — use `run.sh` to configure everything.
 
 ### 1. Clone the Repository
 
@@ -116,11 +116,11 @@ Once the containers start, access the dashboard:
 
 -----
 
-## 📂 Project Structure
+##  Project Structure
 
 ```
 .
-├── run.sh                  # 🚀 Master control script
+├── run.sh                  #  Master control script
 ├── config.py               # Central configuration (auto-modified)
 ├── generate_compose.py     # Generates docker-compose.yml
 │
@@ -140,7 +140,7 @@ Once the containers start, access the dashboard:
 
 ---
 
-## ⚙️ Simulation Flow
+##  Simulation Flow
 
 1. You execute `./run.sh`.
 2. The script updates `config.py` and creates `docker-compose.yml`.
@@ -181,21 +181,21 @@ If running on a remote server via SSH, forward port **6006** to your local machi
 
 ---
 
-## 🧾 License
+##  License
 
 This project is released under the [MIT License](LICENSE).
 Feel free to use, modify, and share it for your research or projects.
 
 ---
 
-## 🤝 Contributing
+##  Contributing
 
 Pull requests and issues are welcome!
 If you’d like to contribute new features (e.g., new datasets or aggregation algorithms), please open an issue first to discuss design details.
 
 ---
 
-## 🧩 Acknowledgments
+##  Acknowledgments
 
 * [PyTorch](https://pytorch.org/)
 * [Docker](https://www.docker.com/)
@@ -203,7 +203,7 @@ If you’d like to contribute new features (e.g., new datasets or aggregation al
 
 ---
 
-> ✨ Designed for reproducible Federated Learning research and educational simulation environments.
+>  Designed for reproducible Federated Learning research and educational simulation environments.
 
 ```
 2. Generate a **`docs/` folder** template for GitHub Pages documentation (with setup + architecture diagrams)?

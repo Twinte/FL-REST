@@ -204,7 +204,3 @@ If you’d like to contribute new features (e.g., new datasets or aggregation al
 ---
 
 >  Designed for reproducible Federated Learning research and educational simulation environments.
-
-```
-2. Generate a **`docs/` folder** template for GitHub Pages documentation (with setup + architecture diagrams)?
-```

@@ -40,7 +40,7 @@ Before running, ensure your system has:
 
 ---
 
-## ⚡ Quick Start
+##  Quick Start
 
 Run a complete simulation with just a few commands.  
 

@@ -166,7 +166,7 @@ Once the containers start, access the dashboard:
 
 ---
 
-## 🛠️ Advanced Usage
+##  Advanced Usage
 
 ### Viewing Logs (Remote/SSH)
 

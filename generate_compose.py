@@ -1,8 +1,31 @@
 import argparse
 import sys
 
-# 1. Static Header (Server + Template)
-YAML_HEADER = """
+# List of environment variables to pass from host to containers
+# These match the variables exported in run.sh
+ENV_VARS = [
+    "MODEL_NAME", "AGGREGATION_STRATEGY", "SERVER_LEARNING_RATE", "SERVER_MOMENTUM",
+    "DEVICE", "TOTAL_ROUNDS", "MIN_CLIENTS_PER_ROUND", "MIN_CLIENTS_FOR_AGGREGATION",
+    "SAVED_MODEL_NAME", "CLIENT_ALGO", "FEDPROX_MU", "TOTAL_CLIENTS",
+    "LOCAL_EPOCHS", "BATCH_SIZE", "LEARNING_RATE", "MOMENTUM", "POLL_INTERVAL",
+    "DIRICHLET_ALPHA", "RANDOM_SEED", "CLIENT_DROPOUT_RATE", "ROUND_TIMEOUT_SEC",
+    "SLOW_SENDER_RATE", "SLOW_SENDER_DELAY_SEC", "NETWORK_LATENCY_RATE",
+    "NETWORK_LATENCY_DELAY_SEC"
+]
+
+def get_env_lines(indent_level):
+    """Generates the list of environment variables formatted for YAML."""
+    indent = " " * indent_level
+    lines = ""
+    for var in ENV_VARS:
+        # Syntax: - VAR=${VAR}
+        lines += f"{indent}- {var}=${{{var}}}\n"
+    return lines
+
+# Pre-generate server environment lines (indentation 6 to match 'environment:' at 4)
+server_env_lines = get_env_lines(6)
+
+YAML_HEADER = f"""
 version: '3.8'
 
 x-client-template: &client-template
@@ -14,7 +37,6 @@ x-client-template: &client-template
   depends_on:
     server:
       condition: service_healthy
-  # Enable NET_ADMIN for all clients so they can use 'tc'
   cap_add:
     - NET_ADMIN
 
@@ -38,6 +60,8 @@ services:
       - ./data:/app/data
       - ./fl_logs:/app/fl_logs
       - ./config.py:/app/config.py
+    environment:
+{server_env_lines}
     deploy:
       resources:
         reservations:
@@ -47,12 +71,12 @@ services:
               capabilities: [gpu]
 """
 
-# 2. Network Profiles Definition
+# Network profiles for 'tc' command
 TC_COMMANDS = {
-    "normal": "",  # No restriction
+    "normal": "",
     "slow": "tc qdisc add dev eth0 root tbf rate 5mbit burst 32kbit latency 400ms",
-    "fast_latency": "tc qdisc add dev eth0 root netem delay 100ms 20ms", # 100ms delay ±20ms jitter
-    "lossy": "tc qdisc add dev eth0 root netem loss 5%", # 5% packet loss
+    "fast_latency": "tc qdisc add dev eth0 root netem delay 100ms 20ms",
+    "lossy": "tc qdisc add dev eth0 root netem loss 5%",
     "mobile": "tc qdisc add dev eth0 root netem delay 50ms 10ms rate 20mbit"
 }
 
@@ -60,10 +84,7 @@ def generate_client_service(client_id, profile="normal"):
     client_id_str = f"{client_id:03d}"
     tc_cmd = TC_COMMANDS.get(profile, "")
     
-    # Construct the startup command
     if tc_cmd:
-        # We use a shell to chain: clean old rules -> apply new rules -> start app
-        # "|| true" ensures we don't crash if no rules existed previously
         command = (
             f'sh -c "tc qdisc del dev eth0 root 2>/dev/null || true && '
             f'{tc_cmd} && '
@@ -73,14 +94,12 @@ def generate_client_service(client_id, profile="normal"):
     else:
         command = "python -m client.app"
 
-    # Hardware resource allocation based on profile
-    # (You can customize this: e.g., 'slow' clients get less CPU)
+    # Hardware resources
     if profile in ["slow", "mobile"]:
         resources = "    cpus: '0.5'\n    mem_limit: '512m'"
-        gpu_deploy = "" # No GPU for slow devices
+        gpu_deploy = ""
     else:
         resources = ""
-        # Give GPU to normal/lossy/fast clients
         gpu_deploy = """
     deploy:
       resources:
@@ -90,13 +109,16 @@ def generate_client_service(client_id, profile="normal"):
               count: 1
               capabilities: [gpu]"""
 
+    # We inject the GLOBAL vars here so they don't get overwritten
+    global_env_lines = get_env_lines(6)
+
     return f"""
   client_{client_id_str}:
     <<: *client-template
     command: >
       {command}
     environment:
-      - CLIENT_ID=client_{client_id_str}
+{global_env_lines}      - CLIENT_ID=client_{client_id_str}
       - SERVER_URL=http://server:5000
       - NETWORK_PROFILE={profile}
 {resources}{gpu_deploy}
@@ -104,9 +126,9 @@ def generate_client_service(client_id, profile="normal"):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate docker-compose with network profiles.")
-    parser.add_argument('--normal', type=int, default=0, help="Count of normal clients")
-    parser.add_argument('--slow', type=int, default=0, help="Count of slow/throttled clients")
-    parser.add_argument('--lossy', type=int, default=0, help="Count of clients with packet loss")
+    parser.add_argument('--normal', type=int, default=0)
+    parser.add_argument('--slow', type=int, default=0)
+    parser.add_argument('--lossy', type=int, default=0)
     args = parser.parse_args()
     
     total_clients = args.normal + args.slow + args.lossy
@@ -117,7 +139,6 @@ def main():
     compose_content = YAML_HEADER
     client_counter = 1
 
-    # Generate entries for each type
     for _ in range(args.normal):
         compose_content += generate_client_service(client_counter, "normal")
         client_counter += 1
@@ -134,9 +155,6 @@ def main():
         with open('docker-compose.yml', 'w') as f:
             f.write(compose_content)
         print(f"✅ Generated docker-compose.yml with {total_clients} clients.")
-        print(f"   - Normal: {args.normal}")
-        print(f"   - Slow:   {args.slow}")
-        print(f"   - Lossy:  {args.lossy}")
     except IOError as e:
         print(f"❌ Error writing to file: {e}")
         sys.exit(1)

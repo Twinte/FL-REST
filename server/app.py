@@ -153,14 +153,15 @@ def evaluate_model(model_state_tensors, test_loader):
     return accuracy, avg_loss
 
 def check_and_aggregate(test_loader):
-    if fl_state["status"] == "AGGREGATING":
-        return
-        
+    """
+    Background worker function.
+    Note: fl_state["status"] is already set to "AGGREGATING" by the caller.
+    """
+    # 1. Cancel Timer if running
     if fl_state["round_timer"]:
         fl_state["round_timer"].cancel()
         fl_state["round_timer"] = None
         
-    fl_state["status"] = "AGGREGATING"
     current_round = fl_state["current_round"]
     
     if len(fl_state["client_updates"]) == 0:
@@ -168,21 +169,20 @@ def check_and_aggregate(test_loader):
     else:
         logger.info(f"--- Aggregating {len(fl_state['client_updates'])} updates for round {current_round} ---")
         
-        # 1. Aggregate
+        # 2. Aggregate (Heavy Math)
         aggregation_result = fl_strategy.aggregate(fl_state["client_updates"])
         
-        # 2. Unwrap Payload (Handle Scaffold vs Standard)
+        # 3. Unwrap Payload (Handle Scaffold vs Standard)
         if isinstance(aggregation_result, dict) and "model_state" in aggregation_result:
             # Complex Strategy (Scaffold)
             new_global_model_tensors = aggregation_result["model_state"]
-            # We save the WHOLE result (including global_c) to send to clients
             payload_to_save = aggregation_result 
         else:
             # Simple Strategy (FedAvg)
             new_global_model_tensors = aggregation_result
             payload_to_save = aggregation_result
 
-        # 3. Evaluate (Use only the model weights)
+        # 4. Evaluate (Use only the model weights)
         if new_global_model_tensors:
             accuracy, loss = evaluate_model(new_global_model_tensors, test_loader)
             
@@ -193,7 +193,7 @@ def check_and_aggregate(test_loader):
             
             logger.info(f"--- Round {current_round} Complete. Accuracy: {accuracy:.2f}%, Loss: {loss:.4f} ---")
             
-            # 4. Save State for Next Round to DISK
+            # 5. Save State for Next Round to DISK
             save_path = get_model_path(current_round + 1)
             try:
                 torch.save(payload_to_save, save_path)
@@ -209,7 +209,7 @@ def check_and_aggregate(test_loader):
                 logger.error(f"Failed to save global model: {e}", exc_info=True)
 
     fl_state["current_round"] += 1
-    fl_state["client_updates"] = [] # Clear updates for next round
+    # Note: client_updates is cleared in start_next_round_timer
     
     if fl_state["current_round"] >= config.TOTAL_ROUNDS:
         logger.info(f"--- All {config.TOTAL_ROUNDS} rounds complete. ---")
@@ -226,7 +226,11 @@ def trigger_aggregation(test_loader):
                 f"--- ROUND {fl_state['current_round']} TIMEOUT ---"
                 f" Received {len(fl_state['client_updates'])} updates."
             )
-            check_and_aggregate(test_loader) 
+            
+            # --- Set status immediately to block other updates ---
+            fl_state["status"] = "AGGREGATING"
+            
+            check_and_aggregate(test_loader)
 
 def start_next_round_timer(test_loader): 
     """Starts the timer for the current round."""
@@ -327,21 +331,16 @@ def submit_update():
             logger.warning(f"SIMULATING DROPOUT: Ignoring update from {client_id}.")
             return jsonify({"status": "Update received"})
         
-        # 2. Parse Binary Data (The Model + Tensors)
+        # 2. Parse Binary Data (Securely)
         file_bytes = request.files['model'].read()
-        
-        # --- FIX: Enforce weights_only=True ---
-        # This prevents a malicious client from crashing the server or taking control.
+        # Secure deserialization (weights_only=True)
         binary_data = torch.load(io.BytesIO(file_bytes), map_location='cpu', weights_only=True)
         
-        # Check if it is a Composite Payload (Model + Extra Tensors)
         if isinstance(binary_data, dict) and "model_state" in binary_data:
             client_state_dict = binary_data["model_state"]
-            # Extract the tensor metrics (e.g. scaffold_delta_c) and merge them back into metrics
             if "tensor_metrics" in binary_data:
                 metrics.update(binary_data["tensor_metrics"])
         else:
-            # It's just a standard model state_dict (Old Client / FedAvg)
             client_state_dict = binary_data
         
     except Exception as e:
@@ -357,7 +356,7 @@ def submit_update():
                 logger.warning(f"Client {client_id} tried to submit a second update.")
                 return jsonify({"error": "Already received update for this round"}), 400
         
-        # Store everything
+        # Store update
         fl_state["client_updates"].append({
             "client_id": client_id,
             "num_samples": num_samples,
@@ -371,9 +370,20 @@ def submit_update():
             f"({len(fl_state['client_updates'])}/{config.MIN_CLIENTS_PER_ROUND})"
         )
         
+        # --- FIX: Non-Blocking Aggregation Trigger ---
         if len(fl_state["client_updates"]) >= config.MIN_CLIENTS_FOR_AGGREGATION:
-            logger.info(f"Quorum met. Triggering aggregation early.")
-            check_and_aggregate(app.config['TEST_LOADER'])
+            logger.info(f"Quorum met. Triggering aggregation in BACKGROUND.")
+            
+            # 1. Change status immediately so no one else enters
+            fl_state["status"] = "AGGREGATING"
+            
+            # 2. Spawn a background thread to do the heavy math
+            # This allows submit_update to return "200 OK" instantly.
+            agg_thread = threading.Thread(
+                target=check_and_aggregate, 
+                args=[app.config['TEST_LOADER']]
+            )
+            agg_thread.start()
         
     return jsonify({"status": "Update received"})
 

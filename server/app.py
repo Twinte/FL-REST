@@ -16,15 +16,23 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from shared.models import get_model
-from server.strategies import get_strategy  # <--- NEW IMPORT
+from server.strategies import get_strategy
 import config
 
 app = Flask(__name__)
 
 werkzeug_logger = logging.getLogger('werkzeug')
 
-log_dir = os.path.join("fl_logs", "tensorboard")
-tb_writer = SummaryWriter(log_dir=log_dir)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+
+LOG_DIR_TB = os.path.join(PROJECT_ROOT, "fl_logs", "tensorboard")
+MODEL_DIR = os.path.join(PROJECT_ROOT, "fl_logs", "models")
+
+os.makedirs(LOG_DIR_TB, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+tb_writer = SummaryWriter(log_dir=LOG_DIR_TB)
 
 # 2. Define a custom filter
 class StatusFilter(logging.Filter):
@@ -47,24 +55,25 @@ fl_state = {
     "round_timer": None          
 }
 
-# We need a place to store the model (as tensors in memory)
-global_models_by_round = {}
-
-# --- NEW: Global strategy variable ---
+# --- Global strategy variable ---
 fl_strategy = None
 # ---
 
+def get_model_path(round_num):
+    """Returns the file path for a specific round's model."""
+    return os.path.join(MODEL_DIR, f"model_round_{round_num}.pth")
+
 def setup_initial_model():
     """
-    Creates the very first model for round 0 and stores it in memory.
+    Creates the very first model for round 0 and saves it to disk.
     Initializes the aggregation strategy.
     """
-    global global_models_by_round, fl_strategy
+    global fl_strategy
     
     # 1. Create the model instance first
     initial_model = get_model(config.MODEL_NAME)
     
-    # 2. Initialize Strategy (NEW)
+    # 2. Initialize Strategy
     fl_strategy = get_strategy(
         config.AGGREGATION_STRATEGY, 
         global_model=initial_model,  # Pass instance for FedOpt
@@ -72,20 +81,13 @@ def setup_initial_model():
         momentum=config.SERVER_MOMENTUM
     )
     
-    # 3. Store the state_dict (tensors) directly
-    global_models_by_round[0] = initial_model.state_dict()
+    # 3. Save the state_dict (tensors) directly to DISK
+    # This prevents keeping it in memory.
+    save_path = get_model_path(0)
+    torch.save(initial_model.state_dict(), save_path)
     
-    logger.info(f"Initial model for round 0 created and stored in memory.")
+    logger.info(f"Initial model for round 0 created and saved to {save_path}.")
     logger.info(f"Strategy: {config.AGGREGATION_STRATEGY} initialized.")
-
-def state_dict_to_bytes(data_payload):
-    """
-    Serializes a payload (Dict or OrderedDict) to bytes.
-    """
-    buffer = io.BytesIO()
-    torch.save(data_payload, buffer)
-    buffer.seek(0)
-    return buffer.read()
 
 # --- Helper Functions ---
 
@@ -191,19 +193,20 @@ def check_and_aggregate(test_loader):
             
             logger.info(f"--- Round {current_round} Complete. Accuracy: {accuracy:.2f}%, Loss: {loss:.4f} ---")
             
-            # 4. Save State for Next Round
-            # We save the wrapped payload so download_model() sends the right data
-            global_models_by_round[current_round + 1] = payload_to_save
-            
-            if current_round == config.TOTAL_ROUNDS - 1:
-                try:
-                    save_path = os.path.join("fl_logs", config.SAVED_MODEL_NAME)
-                    os.makedirs("fl_logs", exist_ok=True)
-                    # For the final file, usually just save the weights
-                    torch.save(new_global_model_tensors, save_path)
-                    logger.info(f"--- Final model saved to {save_path} ---")
-                except Exception as e:
-                    logger.error(f"Failed to save final model: {e}", exc_info=True)
+            # 4. Save State for Next Round to DISK
+            save_path = get_model_path(current_round + 1)
+            try:
+                torch.save(payload_to_save, save_path)
+                logger.info(f"Saved global model for Round {current_round + 1} to {save_path}")
+                
+                # If this was the final round, update the "final" pointer
+                if current_round == config.TOTAL_ROUNDS - 1:
+                    final_path = os.path.join("fl_logs", config.SAVED_MODEL_NAME)
+                    torch.save(new_global_model_tensors, final_path)
+                    logger.info(f"--- Final model saved to {final_path} ---")
+                    
+            except Exception as e:
+                logger.error(f"Failed to save global model: {e}", exc_info=True)
 
     fl_state["current_round"] += 1
     fl_state["client_updates"] = [] # Clear updates for next round
@@ -277,26 +280,24 @@ def get_status():
 
 @app.route('/download_model', methods=['GET'])
 def download_model():
-    global global_models_by_round
-    
     try:
         requested_round = request.args.get('round', type=int)
         if requested_round is None:
             return jsonify({"error": "'round' parameter is required"}), 400
             
-        state_dict = global_models_by_round.get(requested_round)
+        # FIX: Serve directly from disk
+        file_path = get_model_path(requested_round)
         
-        if state_dict:
-            logger.info(f"Serving model for round {requested_round} to a client.")
-            model_bytes = state_dict_to_bytes(state_dict)
+        if os.path.exists(file_path):
+            logger.info(f"Serving model from {file_path}")
             return send_file(
-                io.BytesIO(model_bytes),
+                file_path,
                 mimetype='application/octet-stream',
                 as_attachment=True,
                 download_name=f'model_round_{requested_round}.pth'
             )
         else:
-            logger.warning(f"Client requested model for round {requested_round}, which is not found.")
+            logger.warning(f"Client requested model for round {requested_round}, which is not found at {file_path}.")
             return jsonify({"error": f"Model for round {requested_round} not found."}), 404
             
     except Exception as e:
@@ -358,7 +359,7 @@ def submit_update():
             "client_id": client_id,
             "num_samples": num_samples,
             "model_update": client_state_dict,
-            "metrics": metrics # Now contains both JSON info AND SCAFFOLD Tensors
+            "metrics": metrics 
         })
         
         logger.info(

@@ -329,7 +329,10 @@ def submit_update():
         
         # 2. Parse Binary Data (The Model + Tensors)
         file_bytes = request.files['model'].read()
-        binary_data = torch.load(io.BytesIO(file_bytes), map_location='cpu')
+        
+        # --- FIX: Enforce weights_only=True ---
+        # This prevents a malicious client from crashing the server or taking control.
+        binary_data = torch.load(io.BytesIO(file_bytes), map_location='cpu', weights_only=True)
         
         # Check if it is a Composite Payload (Model + Extra Tensors)
         if isinstance(binary_data, dict) and "model_state" in binary_data:

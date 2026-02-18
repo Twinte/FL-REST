@@ -20,7 +20,9 @@ def set_model_from_bytes(model, model_bytes):
     """
     buffer = io.BytesIO(model_bytes)
     try:
-        data = torch.load(buffer, map_location='cpu')
+        # --- Enforce weights_only=True ---
+        # This prevents Remote Code Execution (RCE) if the server is compromised.
+        data = torch.load(buffer, map_location='cpu', weights_only=True)
         
         # Check if this is a composite payload (SCAFFOLD style)
         if isinstance(data, dict) and "model_state" in data:

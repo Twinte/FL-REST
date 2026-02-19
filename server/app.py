@@ -6,6 +6,8 @@ import io
 import signal
 import threading
 from threading import Timer, Lock
+import psutil
+import time
 import random
 import json
 
@@ -169,8 +171,24 @@ def check_and_aggregate(test_loader):
     else:
         logger.info(f"--- Aggregating {len(fl_state['client_updates'])} updates for round {current_round} ---")
         
-        # 2. Aggregate (Heavy Math)
+        psutil.cpu_percent(interval=None)
+        ram_before_mb = psutil.virtual_memory().used / (1024 * 1024)
+        start_time = time.time()
+        # 2. Aggregate
         aggregation_result = fl_strategy.aggregate(fl_state["client_updates"])
+
+        agg_duration = time.time() - start_time
+        cpu_usage = psutil.cpu_percent(interval=None)
+        ram_after_mb = psutil.virtual_memory().used / (1024 * 1024)
+
+        tb_writer.add_scalar("System/CPU_Usage_Percent", cpu_usage, current_round)
+        tb_writer.add_scalar("System/RAM_Usage_MB", ram_after_mb, current_round)
+        tb_writer.add_scalar("System/RAM_Spike_MB", ram_after_mb - ram_before_mb, current_round)
+        tb_writer.add_scalar("System/Aggregation_Time_Sec", agg_duration, current_round)
+
+        tb_writer.flush()
+
+        logger.info(f"PROFILING: CPU {cpu_usage}%, RAM {ram_after_mb:.2f}MB, Time {agg_duration:.2f}s")
         
         # 3. Unwrap Payload (Handle Scaffold vs Standard)
         if isinstance(aggregation_result, dict) and "model_state" in aggregation_result:

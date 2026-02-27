@@ -7,37 +7,28 @@ import torchvision.transforms as transforms
 import config
 import logging
 
+from data_utils.loader import get_dataset
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def prepare_data():
-    logger.info("--- Starting Data Preparation ---")
+    logger.info(f"--- Starting Data Preparation for {config.DATASET_NAME} ---")
     
-    # 1. Download CIFAR-10 (if not exists)
-    # We use the same transform as training to ensure compatibility
-    logger.info("Checking/Downloading CIFAR-10 dataset...")
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+    # 1. Download Dataset using the factory
+    logger.info(f"Checking/Downloading {config.DATASET_NAME} dataset...")
     
-    # Download to ./data
-    train_dataset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=transform
-    )
-    
-    # Also ensure test set is downloaded for the server
-    torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform
-    )
+    train_dataset = get_dataset(config.DATASET_NAME, train=True, download=True)
+    test_dataset = get_dataset(config.DATASET_NAME, train=False, download=True)
 
     # 2. Calculate Non-IID Partitions
     logger.info(f"Partitioning data for {config.TOTAL_CLIENTS} clients (Alpha={config.DIRICHLET_ALPHA})...")
     
     np.random.seed(config.RANDOM_SEED)
     
-    num_classes = 10
+    # Dynamically get the number of classes from the dataset
+    num_classes = len(train_dataset.classes)
     labels = np.array(train_dataset.targets)
     
     # Get indices for each class
@@ -71,10 +62,13 @@ def prepare_data():
         for i, indices in enumerate(client_partitions)
     }
     
+    # Ensure data directory exists
+    os.makedirs('./data', exist_ok=True)
+    
     with open(partition_file, 'w') as f:
         json.dump(partition_dict, f)
         
-    logger.info("✅ Data preparation complete.")
+    logger.info("Data preparation complete.")
 
 if __name__ == "__main__":
     prepare_data()

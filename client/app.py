@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Subset
 from client.trainer import train_model 
 from client.model_utils import get_model_bytes, set_model_from_bytes
 from client.algorithms import get_client_algorithm
+from data_utils.loader import get_dataset
 from shared.models import get_model
 import config
 
@@ -148,22 +149,17 @@ def check_server_status():
 
 def get_client_dataloader(client_id_num):
     """
-    Loads CIFAR-10 and returns a DataLoader using pre-calculated
+    Loads the configured dataset and returns a DataLoader using pre-calculated
     indices from partitions.json.
     """
-    logger.info(f"Loading data for client {client_id_num}...")
+    logger.info(f"Loading {config.DATASET_NAME} data for client {client_id_num}...")
 
-    transform = transforms.Compose(
-        [transforms.ToTensor(),
-         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-    # 1. Load the dataset (DO NOT DOWNLOAD - It should exist)
+    # 1. Load the dataset using the factory (DO NOT DOWNLOAD - It should exist)
+    # The factory handles the transforms automatically now.
     try:
-        train_dataset = torchvision.datasets.CIFAR10(
-            root='./data', train=True, download=False, transform=transform
-        )
-    except RuntimeError:
-        logger.error("CIFAR-10 dataset not found in ./data! Did you run prepare_data.py?")
+        train_dataset = get_dataset(config.DATASET_NAME, train=True, download=False)
+    except Exception as e:
+        logger.error(f"{config.DATASET_NAME} dataset not found in ./data! Did you run prepare_data.py? Error: {e}")
         raise
 
     # 2. Load the pre-calculated partition indices

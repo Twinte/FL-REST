@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from shared.models import get_model
 from server.strategies import get_strategy
+from data_utils.loader import get_dataset
 import config
 
 app = Flask(__name__)
@@ -94,18 +95,9 @@ def setup_initial_model():
 # --- Helper Functions ---
 
 def load_test_data():
-    """Loads the CIFAR-10 test dataset."""
-    logger.info("Loading CIFAR-10 test dataset...")
-    transform = transforms.Compose(
-        [transforms.ToTensor(),
-         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    
-    test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                           download=True, transform=transform)
-    
-    test_loader = DataLoader(test_dataset, batch_size=128,
-                             shuffle=False, num_workers=2)
-    logger.info("Test dataset loaded.")
+    logger.info(f"Loading {config.DATASET_NAME} test dataset...")
+    test_dataset = get_dataset(config.DATASET_NAME, train=False)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=2)
     return test_loader
 
 def evaluate_model(model_state_tensors, test_loader):

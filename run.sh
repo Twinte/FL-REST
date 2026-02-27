@@ -41,6 +41,7 @@ export NETWORK_LATENCY_DELAY_SEC=5
 export DEVICE="auto"
 export POLL_INTERVAL=10
 export RANDOM_SEED=42
+export DATASET_NAME="CIFAR10"
 export SAVED_MODEL_NAME="final_global_model.pth"
 export MODEL_NAME="SimpleCNN"
 

@@ -36,6 +36,7 @@ POLL_INTERVAL = get_env("POLL_INTERVAL", 10, int)
 # --- Data Configuration ---
 DIRICHLET_ALPHA = get_env("DIRICHLET_ALPHA", 0.5, float)
 RANDOM_SEED = get_env("RANDOM_SEED", 42, int)
+DATASET_NAME = get_env("DATASET_NAME", "CIFAR10")
 
 # --- Simulation of FL Conditions ---
 CLIENT_DROPOUT_RATE = get_env("CLIENT_DROPOUT_RATE", 0.0, float)

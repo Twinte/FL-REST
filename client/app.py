@@ -13,7 +13,6 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
 # --- Assumed Imports (from your project) ---
-# Make sure these paths are correct for your structure
 from client.trainer import train_model 
 from client.model_utils import get_model_bytes, set_model_from_bytes
 from client.algorithms import get_client_algorithm
@@ -31,12 +30,19 @@ logger = logging.getLogger(__name__)
 # --- Server API Functions ---
 
 def register_client():
-    """Registers the client with the server."""
+    """Registers the client with the server, reporting its capacity."""
     url = f"{SERVER_URL}/register"
     try:
-        response = requests.post(url, json={"client_id": CLIENT_ID})
+        response = requests.post(url, json={
+            "client_id": CLIENT_ID,
+            "capacity": config.CLIENT_CAPACITY,  # Report capacity to server
+        })
         if response.status_code == 200:
-            logger.info("Successfully registered. Server status: %s", response.json().get("status"))
+            logger.info(
+                "Successfully registered (capacity=%.2f). Server status: %s",
+                config.CLIENT_CAPACITY,
+                response.json().get("status")
+            )
             return True
         elif response.status_code == 400: # Already registered
              logger.info("Client already registered. Proceeding.")
@@ -47,23 +53,40 @@ def register_client():
         logger.error("Failed to connect to server at %s", url)
         return False
 
-def download_global_model(round_number):
+def download_global_model(round_number, max_retries=5):
     """Downloads the global model from the server for a specific round."""
     url = f"{SERVER_URL}/download_model"
-    try:
-        if config.NETWORK_LATENCY_RATE > 0 and random.random() < config.NETWORK_LATENCY_RATE:
-            delay = config.NETWORK_LATENCY_DELAY_SEC
-            logger.warning(f"SIMULATING NETWORK LATENCY: Delaying download by {delay}s...")
-            time.sleep(delay)
-        response = requests.get(url, params={"round": round_number})
-        if response.status_code == 200:
-            logger.info(f"Downloaded model for round {round_number} ({len(response.content)} bytes).")
-            return response.content
-        logger.error(f"Failed download. Status: {response.status_code}")
-        return None
-    except requests.exceptions.ConnectionError:
-        logger.error("Failed to connect to server at %s", url)
-        return None
+    
+    if config.NETWORK_LATENCY_RATE > 0 and random.random() < config.NETWORK_LATENCY_RATE:
+        delay = config.NETWORK_LATENCY_DELAY_SEC
+        logger.warning(f"SIMULATING NETWORK LATENCY: Delaying download by {delay}s...")
+        time.sleep(delay)
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params={
+                "round": round_number,
+                "client_id": CLIENT_ID
+            }, timeout=120)
+            
+            if response.status_code == 200:
+                logger.info(f"Downloaded model for round {round_number} ({len(response.content)} bytes).")
+                return response.content
+            logger.error(f"Failed download. Status: {response.status_code}")
+            return None
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.Timeout,
+                requests.exceptions.RequestException) as e:
+            wait = 2 ** attempt + random.random()
+            logger.warning(
+                f"Download failed (attempt {attempt+1}/{max_retries}): "
+                f"{type(e).__name__}. Retrying in {wait:.1f}s..."
+            )
+            time.sleep(wait)
+    
+    logger.error(f"Failed to download model after {max_retries} attempts.")
+    return None
 
 def submit_model_update(model, num_samples, metrics):
     """Submits the locally trained model update to the server."""
@@ -71,7 +94,6 @@ def submit_model_update(model, num_samples, metrics):
     
     try:
         # 1. Prepare Binary Data
-        # Start with standard model weights
         binary_data = model.state_dict()
         
         # Check if we have Tensor metrics (like SCAFFOLD's delta_c)
@@ -79,23 +101,19 @@ def submit_model_update(model, num_samples, metrics):
         keys_to_remove = []
         
         for key, value in metrics.items():
-            # Check if it's a Tensor or a dict of Tensors
             if hasattr(value, 'cpu') or (isinstance(value, dict) and len(value) > 0 and hasattr(next(iter(value.values())), 'cpu')):
                 tensor_metrics[key] = value
                 keys_to_remove.append(key)
         
-        # Remove Tensors from the JSON metrics dict to prevent serialization errors
         for k in keys_to_remove:
             del metrics[k]
 
-        # If we found tensors, create a Composite Payload
         if tensor_metrics:
             binary_data = {
                 "model_state": binary_data,
                 "tensor_metrics": tensor_metrics
             }
             
-        # Serialize the binary data
         model_bytes = get_model_bytes(binary_data)
         
         # 2. Update Upload Size Metric
@@ -148,8 +166,8 @@ def check_server_status():
 
 def get_client_dataloader(client_id_num):
     """
-    Loads CIFAR-10 and returns a DataLoader using pre-calculated
-    indices from partitions.json.
+    Loads dataset (CIFAR-10 or CIFAR-100) and returns a DataLoader
+    using pre-calculated indices from partitions.json.
     """
     logger.info(f"Loading data for client {client_id_num}...")
 
@@ -157,16 +175,16 @@ def get_client_dataloader(client_id_num):
         [transforms.ToTensor(),
          transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-    # 1. Load the dataset (DO NOT DOWNLOAD - It should exist)
     try:
-        train_dataset = torchvision.datasets.CIFAR10(
+        dataset_cls = torchvision.datasets.CIFAR100 if config.DATASET_NAME == "CIFAR100" \
+                      else torchvision.datasets.CIFAR10
+        train_dataset = dataset_cls(
             root='./data', train=True, download=False, transform=transform
         )
     except RuntimeError:
-        logger.error("CIFAR-10 dataset not found in ./data! Did you run prepare_data.py?")
+        logger.error(f"{config.DATASET_NAME} dataset not found in ./data! Did you run prepare_data.py?")
         raise
 
-    # 2. Load the pre-calculated partition indices
     partition_file = './data/partitions.json'
     if not os.path.exists(partition_file):
         raise FileNotFoundError(f"Partition file {partition_file} not found.")
@@ -174,12 +192,10 @@ def get_client_dataloader(client_id_num):
     with open(partition_file, 'r') as f:
         partitions = json.load(f)
     
-    # Get indices for THIS client (keys are strings in JSON)
     client_indices = partitions.get(str(client_id_num))
     if client_indices is None:
         raise ValueError(f"No partition found for client {client_id_num}")
 
-    # 3. Create the Subset and DataLoader
     client_subset = Subset(train_dataset, client_indices)
     
     client_loader = DataLoader(client_subset, batch_size=config.BATCH_SIZE,
@@ -191,7 +207,7 @@ def get_client_dataloader(client_id_num):
 # --- Main Client Loop ---
 
 def main():
-    logger.info("--- Starting FL Client %s ---", CLIENT_ID)
+    logger.info("--- Starting FL Client %s (capacity=%.2f) ---", CLIENT_ID, config.CLIENT_CAPACITY)
     
     # 1. Register with the server
     if not register_client():
@@ -208,7 +224,6 @@ def main():
     
     # --- Load this client's data partition ---
     try:
-        # Get the number from the CLIENT_ID (e.g., "client_001" -> 1)
         client_id_num = int(CLIENT_ID.split('_')[-1])
         if client_id_num > config.TOTAL_CLIENTS or client_id_num < 1:
             raise ValueError(f"CLIENT_ID {CLIENT_ID} not in expected range 1-{config.TOTAL_CLIENTS}")
@@ -236,14 +251,12 @@ def main():
         
         # 3. Download and Extract
         try:
-            # set_model_from_bytes now returns the extra payload (e.g., Global C for Scaffold)
             extra_payload = set_model_from_bytes(global_model, model_bytes)
             
             # 4. Train the model using the algorithm
             logger.info("Starting local training...")
             start_time = time.time()
             
-            # Pass algorithm instance and extra payload to train_model
             num_samples, peak_gpu_mb, peak_ram_mb, training_metrics = train_model(
                 global_model, 
                 client_dataloader, 
@@ -263,12 +276,11 @@ def main():
         # 5. Submit model update
         logger.info("Submitting trained model update from %d samples...", num_samples)
         
-        # Combine all metrics
         client_metrics = {
             "training_time_sec": training_time_sec,
             "peak_gpu_mb": peak_gpu_mb,
             "peak_ram_mb": peak_ram_mb,
-            **training_metrics  # Include any additional metrics from training
+            **training_metrics
         }
         
         if not submit_model_update(global_model, num_samples, client_metrics):

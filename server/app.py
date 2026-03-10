@@ -10,6 +10,7 @@ import psutil
 import time
 import random
 import json
+import re
 
 # --- ML Imports ---
 import torch
@@ -17,9 +18,14 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import numpy as np
 from shared.models import get_model
 from server.strategies import get_strategy
 import config
+
+# --- Partial Training --- Import base class for isinstance checks
+# HeteroFL, FedRolex, and FedPrune all inherit from this
+from server.strategies.partial_training_base import PartialTrainingStrategy
 
 app = Flask(__name__)
 
@@ -54,7 +60,8 @@ fl_state = {
     "client_updates": [],
     "registered_clients": set(),
     "aggregation_lock": Lock(), 
-    "round_timer": None          
+    "round_timer": None,
+    "fedprune_round0_ready": False,  # Track if round 0 indices are computed
 }
 
 # --- Global strategy variable ---
@@ -65,6 +72,50 @@ def get_model_path(round_num):
     """Returns the file path for a specific round's model."""
     return os.path.join(MODEL_DIR, f"model_round_{round_num}.pth")
 
+# --- PARTIAL TRAINING --- Per-client model path
+def get_client_model_path(round_num, client_id):
+    """Returns a per-client model path (used by FedPrune for unique indices)."""
+    return os.path.join(MODEL_DIR, f"model_round_{round_num}_{client_id}.pth")
+
+
+def cleanup_model_dir():
+    """Remove ALL .pth files from model directory. Called at startup."""
+    removed = 0
+    for f in os.listdir(MODEL_DIR):
+        if f.endswith('.pth'):
+            try:
+                os.remove(os.path.join(MODEL_DIR, f))
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info(f"Cleaned up {removed} model files from previous run(s).")
+
+
+def cleanup_old_round_files(keep_round):
+    """
+    Remove model files from rounds older than keep_round.
+    Keeps only the current round's global + per-client files.
+    Called after each successful aggregation.
+    """
+    removed = 0
+    for f in os.listdir(MODEL_DIR):
+        if not f.endswith('.pth') or f == config.SAVED_MODEL_NAME:
+            continue
+        # Extract round number from filename: model_round_N.pth or model_round_N_client_XXX.pth
+        m = re.match(r'model_round_(\d+)', f)
+        if m:
+            file_round = int(m.group(1))
+            if file_round < keep_round:
+                try:
+                    os.remove(os.path.join(MODEL_DIR, f))
+                    removed += 1
+                except OSError:
+                    pass
+    if removed > 0:
+        logger.info(f"Cleaned up {removed} model files from rounds < {keep_round}.")
+
+
 def setup_initial_model():
     """
     Creates the very first model for round 0 and saves it to disk.
@@ -72,19 +123,25 @@ def setup_initial_model():
     """
     global fl_strategy
     
+    # Clean up any leftover model files from previous runs
+    cleanup_model_dir()
+    
     # 1. Create the model instance first
     initial_model = get_model(config.MODEL_NAME)
     
     # 2. Initialize Strategy
     fl_strategy = get_strategy(
         config.AGGREGATION_STRATEGY, 
-        global_model=initial_model,  # Pass instance for FedOpt
+        global_model=initial_model,
         lr=config.SERVER_LEARNING_RATE,
-        momentum=config.SERVER_MOMENTUM
+        momentum=config.SERVER_MOMENTUM,
+        # FedPrune-specific (ignored by other strategies via **kwargs)
+        ema_decay=config.EMA_DECAY,
+        importance_alpha=config.IMPORTANCE_ALPHA,
+        total_rounds=config.TOTAL_ROUNDS,
     )
     
     # 3. Save the state_dict (tensors) directly to DISK
-    # This prevents keeping it in memory.
     save_path = get_model_path(0)
     torch.save(initial_model.state_dict(), save_path)
     
@@ -94,69 +151,106 @@ def setup_initial_model():
 # --- Helper Functions ---
 
 def load_test_data():
-    """Loads the CIFAR-10 test dataset."""
-    logger.info("Loading CIFAR-10 test dataset...")
+    """Loads the test dataset (CIFAR-10 or CIFAR-100 based on config)."""
     transform = transforms.Compose(
         [transforms.ToTensor(),
          transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     
-    test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                           download=True, transform=transform)
-    
-    test_loader = DataLoader(test_dataset, batch_size=128,
-                             shuffle=False, num_workers=2)
-    logger.info("Test dataset loaded.")
-    return test_loader
+    dataset_cls = torchvision.datasets.CIFAR100 if config.DATASET_NAME == "CIFAR100" \
+                  else torchvision.datasets.CIFAR10
+    test_dataset = dataset_cls(
+        root='./data', train=False, download=False, transform=transform)
+    logger.info(f"Loaded test dataset: {config.DATASET_NAME} ({len(test_dataset)} samples)")
+    return DataLoader(test_dataset, batch_size=256, shuffle=False)
 
-def evaluate_model(model_state_tensors, test_loader):
-    """Evaluates the global model on the test dataset."""
-    
-    # --- Check for GPU and set device ---
-    forced_device = config.DEVICE.lower()
-    if forced_device == "cpu":
-        device = torch.device("cpu")
-    elif forced_device == "cuda":
-        if not torch.cuda.is_available():
-            logger.warning("CUDA requested but not available! Falling back to CPU.")
-            device = torch.device("cpu")
-        else:
-            device = torch.device("cuda")
-    else: 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    logger.info(f"Evaluating on device: {device}")
-    
+def evaluate_model(model_state_dict, test_loader):
+    """Evaluates a model state_dict on the test set."""
     model = get_model(config.MODEL_NAME)
-    model.load_state_dict(model_state_tensors)
-    model.to(device) 
-    model.eval() 
+    model.load_state_dict(model_state_dict)
+    model.eval()
     
-    criterion = torch.nn.CrossEntropyLoss()
     correct = 0
     total = 0
-    total_loss = 0.0
+    running_loss = 0.0
+    criterion = torch.nn.CrossEntropyLoss()
     
-    with torch.no_grad(): 
-        for data in test_loader:
-            images, labels = data
-            images, labels = images.to(device), labels.to(device)
+    # Per-class tracking — detect num_classes from model's final layer
+    n_classes = 100 if config.DATASET_NAME == "CIFAR100" else 10
+    class_correct = [0] * n_classes
+    class_total = [0] * n_classes
+    
+    with torch.no_grad():
+        for data, target in test_loader:
+            output = model(data)
+            loss = criterion(output, target)
+            running_loss += loss.item()
+            _, predicted = output.max(1)
+            total += target.size(0)
+            correct += predicted.eq(target).sum().item()
             
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-    accuracy = 100 * correct / total
-    avg_loss = total_loss / len(test_loader)
+            # Per-class
+            for c in range(n_classes):
+                mask = target == c
+                class_total[c] += mask.sum().item()
+                class_correct[c] += (predicted[mask] == c).sum().item()
+    
+    accuracy = 100. * correct / total
+    avg_loss = running_loss / len(test_loader)
+    
+    # Log per-class accuracy
+    class_accs = []
+    for c in range(n_classes):
+        if class_total[c] > 0:
+            ca = 100. * class_correct[c] / class_total[c]
+            class_accs.append(ca)
+        else:
+            class_accs.append(0.0)
+    
+    class_acc_str = ",".join(f"{a:.1f}" for a in class_accs)
+    class_std = float(np.std(class_accs))
+    logger.info(f"PER_CLASS_ACC: [{class_acc_str}] std={class_std:.2f}")
     
     return accuracy, avg_loss
 
+
+# --- PARTIAL TRAINING --- Compute and save per-client models
+def prepare_fedprune_round(round_num):
+    """
+    For Partial Training: compute indices for all registered clients and save
+    per-client composite payloads to disk.
+    """
+    if not isinstance(fl_strategy, PartialTrainingStrategy):
+        return
+    
+    participating = list(fl_state["registered_clients"])
+    if not participating:
+        logger.warning(f"{fl_strategy.METHOD_NAME}: No registered clients to compute indices for.")
+        return
+    
+    logger.info(f"{fl_strategy.METHOD_NAME}: Computing indices for {len(participating)} clients (round {round_num})")
+    fl_strategy.compute_client_indices(participating)
+    
+    # Load the shared model weights
+    model_path = get_model_path(round_num)
+    if not os.path.exists(model_path):
+        logger.error(f"{fl_strategy.METHOD_NAME}: Model file {model_path} not found!")
+        return
+    
+    model_state = torch.load(model_path, map_location='cpu', weights_only=True)
+    
+    # Save a per-client composite payload
+    for client_id in participating:
+        payload = fl_strategy.get_payload_for_client(client_id, model_state)
+        client_path = get_client_model_path(round_num, client_id)
+        torch.save(payload, client_path)
+    
+    logger.info(f"{fl_strategy.METHOD_NAME}: Saved {len(participating)} per-client payloads for round {round_num}")
+
+
 def check_and_aggregate(test_loader):
     """
-    Background worker function.
+    Performs aggregation, evaluation, model save, and round advancement.
     Note: fl_state["status"] is already set to "AGGREGATING" by the caller.
     """
     # 1. Cancel Timer if running
@@ -165,6 +259,7 @@ def check_and_aggregate(test_loader):
         fl_state["round_timer"] = None
         
     current_round = fl_state["current_round"]
+    new_global_model_tensors = None
     
     if len(fl_state["client_updates"]) == 0:
         logger.warning(f"No updates received for round {current_round}. Skipping aggregation.")
@@ -185,73 +280,90 @@ def check_and_aggregate(test_loader):
         tb_writer.add_scalar("System/RAM_Usage_MB", ram_after_mb, current_round)
         tb_writer.add_scalar("System/RAM_Spike_MB", ram_after_mb - ram_before_mb, current_round)
         tb_writer.add_scalar("System/Aggregation_Time_Sec", agg_duration, current_round)
-
         tb_writer.flush()
 
         logger.info(f"PROFILING: CPU {cpu_usage}%, RAM {ram_after_mb:.2f}MB, Time {agg_duration:.2f}s")
         
-        # 3. Unwrap Payload (Handle Scaffold vs Standard)
+        # 3. Unwrap Payload (Handle Scaffold/FedPrune vs Standard)
         if isinstance(aggregation_result, dict) and "model_state" in aggregation_result:
-            # Complex Strategy (Scaffold)
             new_global_model_tensors = aggregation_result["model_state"]
             payload_to_save = aggregation_result 
         else:
-            # Simple Strategy (FedAvg)
             new_global_model_tensors = aggregation_result
             payload_to_save = aggregation_result
 
-        # 4. Evaluate (Use only the model weights)
+        # 4. Evaluate
         if new_global_model_tensors:
             accuracy, loss = evaluate_model(new_global_model_tensors, test_loader)
             
-            # Log Metrics
             tb_writer.add_scalar("Global/Accuracy", accuracy, current_round)
             tb_writer.add_scalar("Global/Loss", loss, current_round)
             tb_writer.flush()
             
             logger.info(f"--- Round {current_round} Complete. Accuracy: {accuracy:.2f}%, Loss: {loss:.4f} ---")
             
-            # 5. Save State for Next Round to DISK
-            save_path = get_model_path(current_round + 1)
-            try:
+            # --- PARTIAL TRAINING --- Log EMA diagnostics to TensorBoard
+            if isinstance(fl_strategy, PartialTrainingStrategy):
+                caps = [fl_strategy._get_capacity(c) for c in fl_state["registered_clients"]]
+                cap_std = float(np.std(caps)) if caps else 0.0
+                tb_writer.add_scalar("PartialTraining/cap_std", cap_std, current_round)
+                # imp_frac is FedPrune-specific (capacity-adaptive extraction)
+                if hasattr(fl_strategy, '_compute_imp_frac'):
+                    imp_frac = min(0.9, max(0.5, 0.5 + cap_std))
+                    tb_writer.add_scalar("PartialTraining/imp_frac", imp_frac, current_round)
+            
+            # 5. Save new model
+            next_round = current_round + 1
+            
+            # For Partial Training: save only model_state (per-client payloads built separately)
+            if isinstance(fl_strategy, PartialTrainingStrategy):
+                save_path = get_model_path(next_round)
+                torch.save(new_global_model_tensors, save_path)
+            else:
+                save_path = get_model_path(next_round)
                 torch.save(payload_to_save, save_path)
-                logger.info(f"Saved global model for Round {current_round + 1} to {save_path}")
-                
-                # If this was the final round, update the "final" pointer
-                if current_round == config.TOTAL_ROUNDS - 1:
-                    final_path = os.path.join("fl_logs", config.SAVED_MODEL_NAME)
-                    torch.save(new_global_model_tensors, final_path)
-                    logger.info(f"--- Final model saved to {final_path} ---")
-                    
-            except Exception as e:
-                logger.error(f"Failed to save global model: {e}", exc_info=True)
+            
+            logger.info(f"Saved new model to {save_path}")
+            
+            # Clean up old round files to prevent disk bloat
+            cleanup_old_round_files(keep_round=next_round)
+        else:
+            next_round = current_round + 1
+            logger.warning("Aggregation returned None. Reusing previous model.")
 
-    fl_state["current_round"] += 1
-    # Note: client_updates is cleared in start_next_round_timer
-    
-    if fl_state["current_round"] >= config.TOTAL_ROUNDS:
-        logger.info(f"--- All {config.TOTAL_ROUNDS} rounds complete. ---")
+    # 6. Check Termination
+    next_round = current_round + 1
+    if next_round >= config.TOTAL_ROUNDS:
         fl_state["status"] = "TRAINING_COMPLETE"
-        threading.Timer(2.0, shutdown_server).start()
-    else:
-        start_next_round_timer(test_loader)
+        logger.info(f"--- All {config.TOTAL_ROUNDS} rounds complete! ---")
+        
+        final_path = os.path.join(MODEL_DIR, config.SAVED_MODEL_NAME)
+        if new_global_model_tensors:
+            torch.save(new_global_model_tensors, final_path)
+            logger.info(f"Final model saved to {final_path}")
+        
+        Timer(5, shutdown_server).start()
+        return
+    
+    # 7. Advance to next round
+    fl_state["current_round"] = next_round
+    
+    # --- PARTIAL TRAINING --- Compute indices for next round (all clients are known by now)
+    prepare_fedprune_round(next_round)
+    
+    start_next_round_timer(test_loader)
+
 
 def trigger_aggregation(test_loader):
-    """Callback function for the round timer."""
+    """Called when the round timer expires."""
     with fl_state["aggregation_lock"]:
-        if fl_state["status"] == "WAITING": 
-            logger.info(
-                f"--- ROUND {fl_state['current_round']} TIMEOUT ---"
-                f" Received {len(fl_state['client_updates'])} updates."
-            )
-            
-            # --- Set status immediately to block other updates ---
+        if fl_state["status"] == "WAITING":
+            logger.info("Round timeout reached. Triggering aggregation.")
             fl_state["status"] = "AGGREGATING"
-            
             check_and_aggregate(test_loader)
 
-def start_next_round_timer(test_loader): 
-    """Starts the timer for the current round."""
+
+def start_next_round_timer(test_loader):
     global fl_state
     
     round_num = fl_state["current_round"]
@@ -279,17 +391,37 @@ logger = logging.getLogger(__name__)
 def register():
     data = request.get_json()
     client_id = data.get("client_id")
+    capacity = data.get("capacity", 0.5)  # Clients report their capacity
     
     with fl_state["aggregation_lock"]:
         if client_id not in fl_state["registered_clients"]:
             fl_state["registered_clients"].add(client_id)
-            logger.info(f"Client {client_id} registered. Total clients: {len(fl_state['registered_clients'])}")
+            
+            # --- PARTIAL TRAINING --- Register this client's capacity dynamically
+            if isinstance(fl_strategy, PartialTrainingStrategy):
+                fl_strategy.register_capacity(client_id, capacity)
+            
+            logger.info(
+                f"Client {client_id} registered (capacity={capacity:.2f}). "
+                f"Total: {len(fl_state['registered_clients'])}/{config.TOTAL_CLIENTS}"
+            )
         
+        # Start round timer on first registration (unchanged)
         if fl_state["current_round"] == 0 and fl_state["round_timer"] is None:
             logger.info("First client registered. Starting Round 0 timer.")
             with app.app_context():
                 test_loader = app.config['TEST_LOADER'] 
                 start_next_round_timer(test_loader)    
+        
+        # --- PARTIAL TRAINING --- Once ALL expected clients have registered,
+        # compute round 0 indices so everyone gets pre-computed payloads.
+        if (isinstance(fl_strategy, PartialTrainingStrategy) and 
+            not fl_state["fedprune_round0_ready"] and
+            len(fl_state["registered_clients"]) >= config.TOTAL_CLIENTS):
+            
+            logger.info("All clients registered. Computing partial-training round 0 indices.")
+            prepare_fedprune_round(0)
+            fl_state["fedprune_round0_ready"] = True
         
     return jsonify({"status": fl_state["status"]})
 
@@ -306,8 +438,43 @@ def download_model():
         requested_round = request.args.get('round', type=int)
         if requested_round is None:
             return jsonify({"error": "'round' parameter is required"}), 400
+        
+        # --- PARTIAL TRAINING --- Serve per-client payload for partial-training strategies
+        if isinstance(fl_strategy, PartialTrainingStrategy):
+            client_id = request.args.get('client_id', type=str)
             
-        # FIX: Serve directly from disk
+            if client_id:
+                # Try pre-computed file first
+                client_path = get_client_model_path(requested_round, client_id)
+                if os.path.exists(client_path):
+                    logger.info(f"Serving per-client model for {client_id} from {client_path}")
+                    return send_file(
+                        client_path,
+                        mimetype='application/octet-stream',
+                        as_attachment=True,
+                        download_name=f'model_round_{requested_round}.pth'
+                    )
+                else:
+                    # Pre-computed file not ready — generate on the fly
+                    logger.warning(
+                        f"Per-client model not found for {client_id} round {requested_round}. "
+                        f"Generating on-the-fly."
+                    )
+                    base_path = get_model_path(requested_round)
+                    if os.path.exists(base_path):
+                        model_state = torch.load(base_path, map_location='cpu', weights_only=True)
+                        payload = fl_strategy.get_payload_for_client(client_id, model_state)
+                        torch.save(payload, client_path)
+                        return send_file(
+                            client_path,
+                            mimetype='application/octet-stream',
+                            as_attachment=True,
+                            download_name=f'model_round_{requested_round}.pth'
+                        )
+            
+            logger.warning("Partial-training active but no client_id in download request. Serving base model.")
+        
+        # Standard path: serve shared model file
         file_path = get_model_path(requested_round)
         
         if os.path.exists(file_path):
@@ -319,7 +486,7 @@ def download_model():
                 download_name=f'model_round_{requested_round}.pth'
             )
         else:
-            logger.warning(f"Client requested model for round {requested_round}, which is not found at {file_path}.")
+            logger.warning(f"Client requested model for round {requested_round}, not found at {file_path}.")
             return jsonify({"error": f"Model for round {requested_round} not found."}), 404
             
     except Exception as e:
@@ -351,7 +518,6 @@ def submit_update():
         
         # 2. Parse Binary Data (Securely)
         file_bytes = request.files['model'].read()
-        # Secure deserialization (weights_only=True)
         binary_data = torch.load(io.BytesIO(file_bytes), map_location='cpu', weights_only=True)
         
         if isinstance(binary_data, dict) and "model_state" in binary_data:
@@ -388,15 +554,11 @@ def submit_update():
             f"({len(fl_state['client_updates'])}/{config.MIN_CLIENTS_PER_ROUND})"
         )
         
-        # --- FIX: Non-Blocking Aggregation Trigger ---
+        # --- Non-Blocking Aggregation Trigger ---
         if len(fl_state["client_updates"]) >= config.MIN_CLIENTS_FOR_AGGREGATION:
             logger.info(f"Quorum met. Triggering aggregation in BACKGROUND.")
-            
-            # 1. Change status immediately so no one else enters
             fl_state["status"] = "AGGREGATING"
             
-            # 2. Spawn a background thread to do the heavy math
-            # This allows submit_update to return "200 OK" instantly.
             agg_thread = threading.Thread(
                 target=check_and_aggregate, 
                 args=[app.config['TEST_LOADER']]
@@ -416,4 +578,4 @@ if __name__ == '__main__':
     setup_initial_model() 
     
     logger.info(f"--- FL Server starting... ---")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

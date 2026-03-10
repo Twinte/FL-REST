@@ -34,6 +34,7 @@ MOMENTUM = get_env("MOMENTUM", 0.9, float)
 POLL_INTERVAL = get_env("POLL_INTERVAL", 10, int)
 
 # --- Data Configuration ---
+DATASET_NAME = get_env("DATASET_NAME", "CIFAR10")  # CIFAR10 or CIFAR100
 DIRICHLET_ALPHA = get_env("DIRICHLET_ALPHA", 0.5, float)
 RANDOM_SEED = get_env("RANDOM_SEED", 42, int)
 
@@ -46,3 +47,22 @@ SLOW_SENDER_RATE = get_env("SLOW_SENDER_RATE", 0.0, float)
 SLOW_SENDER_DELAY_SEC = get_env("SLOW_SENDER_DELAY_SEC", 30, int)
 NETWORK_LATENCY_RATE = get_env("NETWORK_LATENCY_RATE", 0.0, float)
 NETWORK_LATENCY_DELAY_SEC = get_env("NETWORK_LATENCY_DELAY_SEC", 5, int)
+
+# =============================================================================
+# FedPrune Configuration
+# =============================================================================
+
+# EMA decay for importance tracking (higher = smoother, slower to adapt)
+EMA_DECAY = get_env("EMA_DECAY", 0.9, float)
+
+# Weight for magnitude vs variance in combined importance score
+# 0.3 = variance-heavy (Neyman Allocation priority), 0.7 = magnitude-heavy
+IMPORTANCE_ALPHA = get_env("IMPORTANCE_ALPHA", 0.3, float)
+
+# FLuID: clients with capacity >= this threshold become leaders (train full model)
+FLUID_LEADER_THRESHOLD = get_env("FLUID_LEADER_THRESHOLD", 0.7, float)
+
+# Per-client capacity ratio (set per container by generate_compose.py).
+# Each client reads its own capacity from this env var and reports it
+# to the server during registration. Default 0.5 if not set.
+CLIENT_CAPACITY = get_env("CLIENT_CAPACITY", 0.5, float)

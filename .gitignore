@@ -11,6 +11,7 @@ config.py.bak # Backup files from sed
 # Logs, data, and saved models
 fl_logs/
 data/
+experiment_results/
 
 # IDE / Editor
 .vscode/
@@ -27,3 +28,12 @@ client/algorithms/fedalert_detector.py
 server/strategies/fedalert_strategy.py
 shared/fedalert_components.py
 test_fedalert_integration.py
+
+#scripts
+run_all_experiments.sh
+run_fedprune.sh
+run_fedrolex.sh
+run_fiarse.sh
+run_fuild.sh
+run_full_experiment_suite.sh
+run_heterofl_sh

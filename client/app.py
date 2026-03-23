@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Subset
 
 # --- Assumed Imports (from your project) ---
 from client.trainer import train_model 
-from client.model_utils import get_model_bytes, set_model_from_bytes
+from client.model_utils import get_model_bytes, set_model_from_bytes, prepare_upload_payload
 from client.algorithms import get_client_algorithm
 from shared.models import get_model
 import config
@@ -54,7 +54,7 @@ def register_client():
         return False
 
 def download_global_model(round_number, max_retries=5):
-    """Downloads the global model from the server for a specific round."""
+    """Downloads the global model with transfer timing instrumentation."""
     url = f"{SERVER_URL}/download_model"
     
     if config.NETWORK_LATENCY_RATE > 0 and random.random() < config.NETWORK_LATENCY_RATE:
@@ -64,16 +64,32 @@ def download_global_model(round_number, max_retries=5):
     
     for attempt in range(max_retries):
         try:
+            dl_start = time.time()
             response = requests.get(url, params={
                 "round": round_number,
                 "client_id": CLIENT_ID
             }, timeout=120)
+            dl_end = time.time()
             
             if response.status_code == 200:
-                logger.info(f"Downloaded model for round {round_number} ({len(response.content)} bytes).")
+                dl_bytes = len(response.content)
+                dl_time = dl_end - dl_start
+                throughput = dl_bytes * 8 / 1024 / max(dl_time, 0.001)
+                
+                logger.info(
+                    f"Downloaded model for round {round_number} ({dl_bytes} bytes)."
+                )
+                # Structured communication metric
+                logger.info(
+                    f"COMM_DL_CLIENT: round={round_number} "
+                    f"bytes={dl_bytes} "
+                    f"transfer_sec={dl_time:.4f} "
+                    f"throughput_kbps={throughput:.1f}"
+                )
                 return response.content
+                
             logger.error(f"Failed download. Status: {response.status_code}")
-            return None
+            
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.Timeout,
@@ -88,32 +104,65 @@ def download_global_model(round_number, max_retries=5):
     logger.error(f"Failed to download model after {max_retries} attempts.")
     return None
 
-def submit_model_update(model, num_samples, metrics):
-    """Submits the locally trained model update to the server."""
+def submit_model_update(model, num_samples, metrics, neuron_indices=None):
+    """
+    Submits the locally trained model update to the server.
+    
+    If neuron_indices is provided and the method supports compact uploads,
+    only the trained neurons are serialized and sent (smaller uplink).
+    
+    Args:
+        model: Trained model
+        num_samples: Number of training samples used
+        metrics: Dict of training metrics (may include tensor_metrics like
+                 FIARSE importance scores)
+        neuron_indices: Dict {layer_name: [indices]} for compact upload,
+                       or None for full upload
+    """
     url = f"{SERVER_URL}/submit_update"
     
     try:
-        # 1. Prepare Binary Data
+        # 1. Prepare Binary Data — compact or full depending on method
         binary_data = model.state_dict()
         
-        # Check if we have Tensor metrics (like SCAFFOLD's delta_c)
+        # Check for Tensor metrics (SCAFFOLD delta_c, FIARSE importance)
         tensor_metrics = {}
         keys_to_remove = []
         
         for key, value in metrics.items():
-            if hasattr(value, 'cpu') or (isinstance(value, dict) and len(value) > 0 and hasattr(next(iter(value.values())), 'cpu')):
+            if hasattr(value, 'cpu') or (isinstance(value, dict) and len(value) > 0 
+                    and hasattr(next(iter(value.values()), None), 'cpu')):
                 tensor_metrics[key] = value
                 keys_to_remove.append(key)
         
         for k in keys_to_remove:
             del metrics[k]
 
-        if tensor_metrics:
-            binary_data = {
-                "model_state": binary_data,
-                "tensor_metrics": tensor_metrics
-            }
+        # Decide upload format
+        if neuron_indices and config.CLIENT_ALGO not in ("FIARSE",):
+            from shared.submodel_utils import extract_trained_submodel
+            submodel_state = extract_trained_submodel(model, neuron_indices)
             
+            # Send flat tensor dict — no wrapper.
+            # The is_submodel flag travels in the JSON metadata.
+            binary_data = submodel_state
+            
+            # tensor_metrics (e.g. FIARSE importance) won't apply here
+            # since we're in the non-FIARSE branch, but handle just in case
+            if tensor_metrics:
+                binary_data = {
+                    "model_state": submodel_state,
+                    "tensor_metrics": tensor_metrics,
+                }
+        else:
+            # Full upload (standard, FIARSE, or no indices)
+            if tensor_metrics:
+                binary_data = {
+                    "model_state": binary_data,
+                    "tensor_metrics": tensor_metrics,
+                }
+            
+        # Serialize
         model_bytes = get_model_bytes(binary_data)
         
         # 2. Update Upload Size Metric
@@ -123,7 +172,8 @@ def submit_model_update(model, num_samples, metrics):
         metadata = {
             "client_id": CLIENT_ID,
             "num_samples": num_samples,
-            "metrics": metrics 
+            "metrics": metrics,
+            "is_submodel": True if (neuron_indices and config.CLIENT_ALGO not in ("FIARSE",)) else False,
         }
         
         # 4. Send Multipart Request
@@ -138,10 +188,22 @@ def submit_model_update(model, num_samples, metrics):
             logger.warning(f"SIMULATING SLOW SENDER: Delaying by {delay}s...")
             time.sleep(delay)
 
+        ul_start = time.time()
         response = requests.post(url, files=files)
+        ul_end = time.time()
         
         if response.status_code == 200:
+            ul_time = ul_end - ul_start
+            throughput = len(model_bytes) * 8 / 1024 / max(ul_time, 0.001)
+            
             logger.info("Successfully submitted model update.")
+            # Structured communication metric
+            logger.info(
+                f"COMM_UL_CLIENT: "
+                f"bytes={len(model_bytes)} "
+                f"transfer_sec={ul_time:.4f} "
+                f"throughput_kbps={throughput:.1f}"
+            )
             return True
         
         logger.error(f"Failed to submit update. Status: {response.status_code}, Body: {response.text}")
@@ -150,6 +212,63 @@ def submit_model_update(model, num_samples, metrics):
     except Exception as e:
         logger.error(f"Error during model submission: {e}", exc_info=True)
         return False
+
+
+
+def _extract_upload_submodel(model, indices):
+    """Extract only the neurons this client trained for upload."""
+    state = model.state_dict()
+    submodel = {}
+    
+    layer_order = []
+    for name, param in model.named_parameters():
+        if 'weight' in name and 'bn' not in name and param.dim() >= 2:
+            if name != 'fc3.weight':
+                layer_order.append(name)
+    
+    prev_indices = None
+    
+    for layer_name in layer_order:
+        if layer_name not in indices:
+            continue
+        
+        out_idx = indices[layer_name]
+        weight_key = layer_name
+        bias_key = layer_name.replace('.weight', '.bias')
+        
+        w = state[weight_key]
+        w_sub = w[out_idx]
+        
+        if prev_indices is not None and w_sub.dim() >= 2:
+            if w_sub.dim() == 4:
+                w_sub = w_sub[:, prev_indices]
+            elif w_sub.dim() == 2:
+                w_sub = w_sub[:, prev_indices]
+        
+        submodel[weight_key] = w_sub
+        
+        if bias_key in state:
+            submodel[bias_key] = state[bias_key][out_idx]
+        
+        bn_prefix = layer_name.replace('conv', 'bn').replace('.weight', '')
+        for suffix in ['.weight', '.bias', '.running_mean', '.running_var']:
+            bn_key = bn_prefix + suffix
+            if bn_key in state:
+                submodel[bn_key] = state[bn_key][out_idx]
+        
+        prev_indices = out_idx
+    
+    fc3_w_key = 'fc3.weight'
+    fc3_b_key = 'fc3.bias'
+    if fc3_w_key in state:
+        fc3_w = state[fc3_w_key]
+        if prev_indices is not None:
+            fc3_w = fc3_w[:, prev_indices]
+        submodel[fc3_w_key] = fc3_w
+    if fc3_b_key in state:
+        submodel[fc3_b_key] = state[fc3_b_key]
+    
+    return {"model_state": submodel, "is_submodel": True, "indices": indices}
 
 def check_server_status():
     """Polls the server for its current status and round."""
@@ -252,7 +371,7 @@ def main():
         # 3. Download and Extract
         try:
             extra_payload = set_model_from_bytes(global_model, model_bytes)
-            
+
             # 4. Train the model using the algorithm
             logger.info("Starting local training...")
             start_time = time.time()
@@ -283,7 +402,8 @@ def main():
             **training_metrics
         }
         
-        if not submit_model_update(global_model, num_samples, client_metrics):
+        if not submit_model_update(global_model, num_samples, client_metrics, 
+                                   neuron_indices=extra_payload):
             logger.warning("Failed to submit update. Retrying in 10s.")
             time.sleep(10)
             continue 

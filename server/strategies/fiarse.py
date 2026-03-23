@@ -134,3 +134,36 @@ class FIARSEStrategy(PartialTrainingStrategy):
                 )
         
         self.importance_initialized = True
+
+    def get_payload_for_client(self, client_id, model_state_dict):
+        """
+        FIARSE override: always send FULL model.
+        
+        FIARSE clients need the complete model for gradient-based importance
+        computation (full forward+backward pass on all neurons). This is the
+        method's fundamental cost — and what makes it communication-expensive
+        compared to FedPrune.
+        """
+        indices = self.round_indices.get(client_id)
+        
+        if indices is None:
+            keep_ratio = self._get_capacity(client_id)
+            indices = self._compute_indices_for_client(
+                client_id, keep_ratio, self.current_round)
+            if 'fc3.weight' in self.layer_sizes and 'fc3.weight' not in indices:
+                indices['fc3.weight'] = list(range(self.layer_sizes['fc3.weight']))
+            self.round_indices[client_id] = indices
+        
+        clean_indices = {k: list(v) for k, v in indices.items()}
+        
+        full_size = sum(v.numel() * 4 for v in model_state_dict.values())
+        logger.info(
+            f"  FIARSE: {client_id} payload {full_size/1024:.1f}KB "
+            f"(FULL MODEL — required for importance computation)"
+        )
+        
+        return {
+            "model_state": model_state_dict,    # FULL — not extracted
+            "extra_payload": clean_indices,
+            "is_submodel": False,               # Client loads directly
+        }

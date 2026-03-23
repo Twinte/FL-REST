@@ -27,6 +27,7 @@ import torch
 import numpy as np
 import logging
 from .partial_training_base import PartialTrainingStrategy
+from shared.submodel_utils import extract_submodel
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +210,51 @@ class FLuIDStrategy(PartialTrainingStrategy):
             # Free pre-aggregation state to avoid memory accumulation
             self._pre_agg_state = None
             self._participating_ids = None
+
+    def get_payload_for_client(self, client_id, model_state_dict):
+        """
+        FLuID override: leaders get full model, stragglers get submodel.
+        
+        Leaders must train the full model so their update deltas can be
+        used to compute importance for stragglers. This is FLuID's
+        structural dependency — and its vulnerability if leaders drop.
+        """
+        indices = self.round_indices.get(client_id)
+        
+        if indices is None:
+            keep_ratio = self._get_capacity(client_id)
+            indices = self._compute_indices_for_client(
+                client_id, keep_ratio, self.current_round)
+            if 'fc3.weight' in self.layer_sizes and 'fc3.weight' not in indices:
+                indices['fc3.weight'] = list(range(self.layer_sizes['fc3.weight']))
+            self.round_indices[client_id] = indices
+        
+        clean_indices = {k: list(v) for k, v in indices.items()}
+        
+        full_size = sum(v.numel() * 4 for v in model_state_dict.values())
+        
+        if client_id in self.leader_clients:
+            # Leaders: full model (they train everything)
+            logger.info(
+                f"  FLuID: {client_id} (LEADER) payload {full_size/1024:.1f}KB "
+                f"(FULL MODEL)"
+            )
+            return {
+                "model_state": model_state_dict,
+                "extra_payload": clean_indices,
+                "is_submodel": False,
+            }
+        else:
+            # Stragglers: compact submodel
+            submodel_state = extract_submodel(model_state_dict, clean_indices)
+            sub_size = sum(v.numel() * 4 for v in submodel_state.values())
+            logger.info(
+                f"  FLuID: {client_id} (STRAGGLER) payload "
+                f"{sub_size/1024:.1f}KB / {full_size/1024:.1f}KB "
+                f"({100*sub_size/full_size:.1f}%)"
+            )
+            return {
+                "model_state": submodel_state,
+                "extra_payload": clean_indices,
+                "is_submodel": True,
+            }

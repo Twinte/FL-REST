@@ -109,6 +109,10 @@ TC_COMMANDS = {
     "fast_latency": "tc qdisc add dev eth0 root netem delay 100ms 20ms",
     "lossy": "tc qdisc add dev eth0 root netem loss 5%",
     "mobile": "tc qdisc add dev eth0 root netem delay 50ms 10ms rate 20mbit",
+    "bw_1mbps":  "tc qdisc add dev eth0 root tbf rate 1mbit burst 32kbit latency 400ms",
+    "bw_5mbps":  "tc qdisc add dev eth0 root tbf rate 5mbit burst 32kbit latency 400ms",
+    "bw_10mbps": "tc qdisc add dev eth0 root tbf rate 10mbit burst 32kbit latency 400ms",
+    "bw_50mbps": "tc qdisc add dev eth0 root tbf rate 50mbit burst 64kbit latency 100ms",
 }
 
 
@@ -258,7 +262,62 @@ def generate_client_service(client_id, profile="normal"):
       - CLIENT_CAPACITY={capacity}
 {resource_lines}{gpu_deploy}
 """
+def generate_client_service_with_bandwidth(client_id, device_profile, network_profile):
+    """
+    Generate client with device profile resources + bandwidth cap network shaping.
+    Device profile controls: CPU, memory, GPU, capacity.
+    Network profile controls: tc bandwidth cap.
+    """
+    client_id_str = f"{client_id:03d}"
+    device_cfg = DEVICE_PROFILES[device_profile]
+    capacity = get_profile_capacity(device_profile)
+    tc_cmd = TC_COMMANDS.get(network_profile, "")
 
+    if tc_cmd:
+        command = (
+            f'sh -c "tc qdisc del dev eth0 root 2>/dev/null || true && '
+            f'{tc_cmd} && '
+            f"echo '[Device] {device_profile} (cap={capacity}) "
+            f"[Network] {network_profile}' && "
+            f'python -m client.app"'
+        )
+    else:
+        command = "python -m client.app"
+
+    resource_lines = ""
+    constraints = []
+    if device_cfg["cpus"] is not None:
+        constraints.append(f"    cpus: '{device_cfg['cpus']}'")
+    if device_cfg["mem_limit"] is not None:
+        constraints.append(f"    mem_limit: '{device_cfg['mem_limit']}'")
+    resource_lines = "\n".join(constraints) if constraints else ""
+
+    gpu_deploy = ""
+    if device_cfg["gpu"]:
+        gpu_deploy = """
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]"""
+
+    global_env_lines = get_env_lines(6)
+
+    return f"""
+  client_{client_id_str}:
+    <<: *client-template
+    command: >
+      {command}
+    environment:
+{global_env_lines}      - CLIENT_ID=client_{client_id_str}
+      - SERVER_URL=http://server:5000
+      - DEVICE_PROFILE={device_profile}
+      - NETWORK_PROFILE={network_profile}
+      - CLIENT_CAPACITY={capacity}
+{resource_lines}{gpu_deploy}
+"""
 
 # =============================================================================
 # CLI
@@ -296,8 +355,22 @@ Examples:
                         help='Slow network clients (5mbit cap)')
     parser.add_argument('--lossy', type=int, default=0,
                         help='Lossy network clients (5%% packet loss)')
+    parser.add_argument('--bw_1mbps', type=int, default=0,
+                        help='Number of clients with 1 Mbps bandwidth cap')
+    parser.add_argument('--bw_5mbps', type=int, default=0,
+                        help='Number of clients with 5 Mbps bandwidth cap')
+    parser.add_argument('--bw_10mbps', type=int, default=0,
+                        help='Number of clients with 10 Mbps bandwidth cap')
+    parser.add_argument('--bw_50mbps', type=int, default=0,
+                        help='Number of clients with 50 Mbps bandwidth cap')
+    parser.add_argument('--bandwidth', type=str, default=None,
+                        choices=['1mbps', '5mbps', '10mbps', '50mbps'],
+                        help='Apply bandwidth cap to ALL clients')
     
     args = parser.parse_args()
+
+    # Determine bandwidth override
+    bw_override = f"bw_{args.bandwidth}" if args.bandwidth else None
     
     # Build ordered list of (count, profile_name) pairs
     profile_order = [
@@ -307,35 +380,49 @@ Examples:
         (args.normal, "normal"),
         (args.slow, "slow"),
         (args.lossy, "lossy"),
+        (args.bw_1mbps, "bw_1mbps"),
+        (args.bw_5mbps, "bw_5mbps"),
+        (args.bw_10mbps, "bw_10mbps"),
+        (args.bw_50mbps, "bw_50mbps"),
     ]
     
     total_clients = sum(count for count, _ in profile_order)
     if total_clients < 1:
-        print("❌ Error: Must have at least one client.")
+        print("Error: Must have at least one client.")
         sys.exit(1)
 
     compose_content = YAML_HEADER
     client_counter = 1
 
     print(f"📊 Client profiles ({total_clients} total):")
+    if bw_override:
+        print(f"   ⚡ Bandwidth cap: {args.bandwidth} applied to ALL clients")
     
     for count, profile in profile_order:
         for _ in range(count):
-            compose_content += generate_client_service(client_counter, profile)
+            if bw_override and profile in DEVICE_PROFILES:
+                compose_content += generate_client_service_with_bandwidth(
+                    client_counter, profile, bw_override)
+            elif bw_override:
+                compose_content += generate_client_service(client_counter, bw_override)
+            else:
+                compose_content += generate_client_service(client_counter, profile)
+            
             cap = get_profile_capacity(profile)
+            bw_tag = f"  [bw={args.bandwidth}]" if bw_override else ""
             if profile in DEVICE_PROFILES:
                 desc = DEVICE_PROFILES[profile]["description"]
-                print(f"   client_{client_counter:03d} → {profile:10s} capacity={cap:.1f}  ({desc})")
+                print(f"   client_{client_counter:03d} → {profile:10s} capacity={cap:.1f}  ({desc}){bw_tag}")
             else:
-                print(f"   client_{client_counter:03d} → {profile:10s} capacity={cap:.1f}  (network profile)")
+                print(f"   client_{client_counter:03d} → {profile:10s} capacity={cap:.1f}  (network profile){bw_tag}")
             client_counter += 1
 
     try:
         with open('docker-compose.yml', 'w') as f:
             f.write(compose_content)
-        print(f"✅ Generated docker-compose.yml with {total_clients} clients.")
+        print(f"Generated docker-compose.yml with {total_clients} clients.")
     except IOError as e:
-        print(f"❌ Error writing to file: {e}")
+        print(f"Error writing to file: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

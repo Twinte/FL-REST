@@ -8,8 +8,10 @@ import threading
 from threading import Timer, Lock
 import psutil
 import time
+import time as _time
 import random
 import json
+import json as json_stdlib
 import re
 
 # --- ML Imports ---
@@ -63,6 +65,20 @@ fl_state = {
     "round_timer": None,
     "fedprune_round0_ready": False,  # Track if round 0 indices are computed
 }
+
+# Structured communication metrics — written to disk every round
+COMM_METRICS_PATH = os.path.join("fl_logs", "round_metrics.jsonl")
+
+def log_round_metrics(round_num, metrics_dict):
+    """Write one line of JSON to round_metrics.jsonl for post-experiment parsing."""
+    metrics_dict["round"] = round_num
+    metrics_dict["wall_timestamp"] = time.time()
+    try:
+        with open(COMM_METRICS_PATH, "a") as f:
+            f.write(json_stdlib.dumps(metrics_dict) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to write round metrics: {e}")
+
 
 # --- Global strategy variable ---
 fl_strategy = None
@@ -166,8 +182,10 @@ def load_test_data():
 
 def evaluate_model(model_state_dict, test_loader):
     """Evaluates a model state_dict on the test set."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = get_model(config.MODEL_NAME)
     model.load_state_dict(model_state_dict)
+    model.to(device)
     model.eval()
     
     correct = 0
@@ -182,6 +200,7 @@ def evaluate_model(model_state_dict, test_loader):
     
     with torch.no_grad():
         for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
             output = model(data)
             loss = criterion(output, target)
             running_loss += loss.item()
@@ -270,7 +289,10 @@ def check_and_aggregate(test_loader):
         ram_before_mb = psutil.virtual_memory().used / (1024 * 1024)
         start_time = time.time()
         # 2. Aggregate
+        t0 = _time.time()
         aggregation_result = fl_strategy.aggregate(fl_state["client_updates"])
+        t1 = _time.time()
+        logger.info(f"TIMING: AGGREGATE={t1 - t0:.2f}s")
 
         agg_duration = time.time() - start_time
         cpu_usage = psutil.cpu_percent(interval=None)
@@ -294,13 +316,36 @@ def check_and_aggregate(test_loader):
 
         # 4. Evaluate
         if new_global_model_tensors:
+            t2 = _time.time()
             accuracy, loss = evaluate_model(new_global_model_tensors, test_loader)
-            
+            t3 = _time.time()
+            logger.info(f"TIMING: EVALUATE={t3 - t2:.2f}s")
             tb_writer.add_scalar("Global/Accuracy", accuracy, current_round)
             tb_writer.add_scalar("Global/Loss", loss, current_round)
             tb_writer.flush()
             
             logger.info(f"--- Round {current_round} Complete. Accuracy: {accuracy:.2f}%, Loss: {loss:.4f} ---")
+
+            # Log structured round metrics for communication analysis
+            client_comms = []
+            for update in fl_state["client_updates"]:
+                cid = update["client_id"]
+                m = update.get("metrics", {})
+                client_comms.append({
+                    "client_id": cid,
+                    "upload_mb": m.get("payload_size_mb", 0),
+                    "training_time_sec": m.get("training_time_sec", 0),
+                    "peak_gpu_mb": m.get("peak_gpu_mb", 0),
+                    "peak_ram_mb": m.get("peak_ram_mb", 0),
+                })
+
+            log_round_metrics(current_round, {
+                "n_clients": len(fl_state["client_updates"]),
+                "accuracy": accuracy,
+                "loss": loss,
+                "agg_duration_sec": agg_duration,
+                "clients": client_comms,
+            })
             
             # --- PARTIAL TRAINING --- Log EMA diagnostics to TensorBoard
             if isinstance(fl_strategy, PartialTrainingStrategy):
@@ -317,8 +362,11 @@ def check_and_aggregate(test_loader):
             
             # For Partial Training: save only model_state (per-client payloads built separately)
             if isinstance(fl_strategy, PartialTrainingStrategy):
+                t4 = _time.time()
                 save_path = get_model_path(next_round)
                 torch.save(new_global_model_tensors, save_path)
+                t5 = _time.time()
+                logger.info(f"TIMING: SAVE_MODEL={t5 - t4:.2f}s")
             else:
                 save_path = get_model_path(next_round)
                 torch.save(payload_to_save, save_path)
@@ -349,7 +397,12 @@ def check_and_aggregate(test_loader):
     fl_state["current_round"] = next_round
     
     # --- PARTIAL TRAINING --- Compute indices for next round (all clients are known by now)
+    t6 = _time.time()
     prepare_fedprune_round(next_round)
+    t7 = _time.time()
+    logger.info(f"TIMING: PREPARE_ROUND={t7 - t6:.2f}s")
+
+    logger.info(f"Total round processing time: {t7 - t0:.2f}s")
     
     start_next_round_timer(test_loader)
 
@@ -439,7 +492,7 @@ def download_model():
         if requested_round is None:
             return jsonify({"error": "'round' parameter is required"}), 400
         
-        # --- PARTIAL TRAINING --- Serve per-client payload for partial-training strategies
+        # --- PARTIAL TRAINING --- Serve per-client payload
         if isinstance(fl_strategy, PartialTrainingStrategy):
             client_id = request.args.get('client_id', type=str)
             
@@ -447,6 +500,11 @@ def download_model():
                 # Try pre-computed file first
                 client_path = get_client_model_path(requested_round, client_id)
                 if os.path.exists(client_path):
+                    dl_bytes = os.path.getsize(client_path)                         # <<< NEW
+                    logger.info(
+                        f"COMM_DL: client={client_id} round={requested_round} "     # <<< NEW
+                        f"bytes={dl_bytes} timestamp={time.time():.4f}"             # <<< NEW
+                    )                                                                # <<< NEW
                     logger.info(f"Serving per-client model for {client_id} from {client_path}")
                     return send_file(
                         client_path,
@@ -465,6 +523,11 @@ def download_model():
                         model_state = torch.load(base_path, map_location='cpu', weights_only=True)
                         payload = fl_strategy.get_payload_for_client(client_id, model_state)
                         torch.save(payload, client_path)
+                        dl_bytes = os.path.getsize(client_path)                     # <<< NEW
+                        logger.info(
+                            f"COMM_DL: client={client_id} round={requested_round} " # <<< NEW
+                            f"bytes={dl_bytes} timestamp={time.time():.4f}"         # <<< NEW
+                        )                                                            # <<< NEW
                         return send_file(
                             client_path,
                             mimetype='application/octet-stream',
@@ -478,6 +541,11 @@ def download_model():
         file_path = get_model_path(requested_round)
         
         if os.path.exists(file_path):
+            dl_bytes = os.path.getsize(file_path)                                   # <<< NEW
+            logger.info(
+                f"COMM_DL: client=shared round={requested_round} "                  # <<< NEW
+                f"bytes={dl_bytes} timestamp={time.time():.4f}"                     # <<< NEW
+            )                                                                        # <<< NEW
             logger.info(f"Serving model from {file_path}")
             return send_file(
                 file_path,
@@ -506,7 +574,7 @@ def submit_update():
         metadata = json.loads(request.form['json'])
         client_id = metadata.get('client_id')
         num_samples = metadata.get('num_samples')
-        metrics = metadata.get('metrics', {}) 
+        metrics = metadata.get('metrics', {})
         
         if not all([client_id, num_samples is not None]):
             return jsonify({"error": "Missing required metadata"}), 400
@@ -516,16 +584,33 @@ def submit_update():
             logger.warning(f"SIMULATING DROPOUT: Ignoring update from {client_id}.")
             return jsonify({"status": "Update received"})
         
-        # 2. Parse Binary Data (Securely)
+        # 2. Read binary data (ONCE)
         file_bytes = request.files['model'].read()
+        
+        # 3. Log upload size
+        logger.info(
+            f"COMM_UL: client={client_id} round={fl_state['current_round']} "
+            f"bytes={len(file_bytes)} timestamp={time.time():.4f}"
+        )
+        
+        # 4. Deserialize
         binary_data = torch.load(io.BytesIO(file_bytes), map_location='cpu', weights_only=True)
         
+        # 5. Unwrap based on payload structure
         if isinstance(binary_data, dict) and "model_state" in binary_data:
             client_state_dict = binary_data["model_state"]
             if "tensor_metrics" in binary_data:
                 metrics.update(binary_data["tensor_metrics"])
         else:
             client_state_dict = binary_data
+        
+        # 6. Check JSON metadata for compact submodel flag
+        is_submodel = metadata.get("is_submodel", False)
+        if is_submodel:
+            client_state_dict = {
+                "model_state": client_state_dict,
+                "is_submodel": True,
+            }
         
     except Exception as e:
         logger.error(f"Error parsing client update: {e}", exc_info=True)
@@ -545,7 +630,8 @@ def submit_update():
             "client_id": client_id,
             "num_samples": num_samples,
             "model_update": client_state_dict,
-            "metrics": metrics 
+            "metrics": metrics,
+            "is_submodel": is_submodel,
         })
         
         logger.info(
@@ -554,13 +640,13 @@ def submit_update():
             f"({len(fl_state['client_updates'])}/{config.MIN_CLIENTS_PER_ROUND})"
         )
         
-        # --- Non-Blocking Aggregation Trigger ---
+        # Non-Blocking Aggregation Trigger
         if len(fl_state["client_updates"]) >= config.MIN_CLIENTS_FOR_AGGREGATION:
             logger.info(f"Quorum met. Triggering aggregation in BACKGROUND.")
             fl_state["status"] = "AGGREGATING"
             
             agg_thread = threading.Thread(
-                target=check_and_aggregate, 
+                target=check_and_aggregate,
                 args=[app.config['TEST_LOADER']]
             )
             agg_thread.start()

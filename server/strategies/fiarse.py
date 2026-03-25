@@ -1,169 +1,106 @@
 """
-FIARSE Server Strategy for FL-REST
-====================================
-Client-side gradient importance with server-side EMA aggregation.
-(Anonymous, NeurIPS 2024)
+FIARSE Server Strategy for FL-REST (CORRECTED)
+=================================================
+Importance-Aware Submodel Extraction via parameter magnitude.
+(Wu et al., "FIARSE: Model-Heterogeneous FL via Importance-Aware
+Submodel Extraction", NeurIPS 2024)
 
-How it works:
-  1. Each client computes grad x weight importance on local data
-  2. Client uploads importance alongside model update (via tensor_metrics)
-  3. Server aggregates all client importances via EMA
-  4. Server uses aggregated importance for top-k neuron extraction
+PAPER ALGORITHM (Algorithm 1):
+  1. Server extracts submodel for client i by selecting parameters
+     whose absolute value exceeds threshold θ_i = TopK_γi(|x̃|)
+  2. Client trains using Threshold-Controlled Biased Gradient Descent
+     (TCB-GD), which dynamically shrinks the mask during local training
+  3. Client sends delta Δx = x̃_t - x^(i)_{t,K} back to server
+  4. Server aggregates via partial averaging
 
-Key difference from FedPrune:
-  - Importance source: CLIENT-SIDE (gradient-based) vs SERVER-SIDE (weight statistics)
-  - Extra cost: Clients must run full-model forward+backward for importance
-  - Privacy: Client importance scores leak information about local data
+KEY INSIGHT (from paper Section 4):
+  Parameter magnitude IS the importance signal. No separate importance
+  computation is needed. The TCB-GD biased gradient naturally pushes
+  important parameters to grow and unimportant ones to shrink below
+  threshold, making magnitudes increasingly reflective of true importance.
 
-This is the strongest importance-aware baseline -- if FedPrune matches
-FIARSE accuracy, it validates the server-side approach with zero client cost.
+NOTE ON STRUCTURED VS UNSTRUCTURED:
+  The paper operates at the individual parameter (weight) level —
+  unstructured sparsity. Our framework uses neuron-level (structured)
+  extraction. We adapt by computing per-neuron magnitude as the mean
+  absolute weight, then selecting top-K neurons. Paper Section 7
+  notes neuron-wise extraction as future work.
 """
 
 import torch
 import numpy as np
 import logging
 from .partial_training_base import PartialTrainingStrategy
+from shared.submodel_utils import extract_submodel
 
 logger = logging.getLogger(__name__)
 
 
 class FIARSEStrategy(PartialTrainingStrategy):
-    
+
     METHOD_NAME = "FIARSE"
-    
+
     def __init__(self, global_model, ema_decay=0.9, total_rounds=100):
+        """
+        Args:
+            global_model: PyTorch model instance.
+            ema_decay: Accepted for factory compatibility but NOT USED.
+                       Real FIARSE has no EMA — magnitudes are read fresh
+                       from the global model each round.
+            total_rounds: Total FL communication rounds.
+        """
         super().__init__(global_model, total_rounds)
-        
-        self.ema_decay = ema_decay
-        
-        # EMA of aggregated client importance scores
-        self.importance = {name: None for name, _ in self.prunable_layers}
-        self.importance_initialized = False
-        
-        logger.info(f"FIARSE: Using client-side gradient importance, EMA decay={ema_decay}")
-    
+        # ema_decay intentionally unused — FIARSE uses live magnitudes
+        logger.info(
+            "FIARSE: Using magnitude-based top-K neuron extraction "
+            "(adapted from per-parameter to per-neuron for structured pruning)"
+        )
+
     # -----------------------------------------------------------------
-    # Index computation: top-k by aggregated client importance
+    # Index computation: top-K neurons by global model magnitude
     # -----------------------------------------------------------------
-    
+
     def _compute_indices_for_client(self, client_id, keep_ratio, round_num):
-        """Top-k neurons by aggregated client importance (or magnitude fallback)."""
-        if not self.importance_initialized:
-            return self._magnitude_fallback(keep_ratio)
-        
-        indices = {}
-        for name, _ in self.prunable_layers:
-            imp = self.importance[name]
-            if imp is None:
-                continue
-            n_total = len(imp)
-            n_keep = max(1, int(n_total * keep_ratio))
-            top_idx = np.argsort(imp)[-n_keep:]
-            indices[name] = sorted(top_idx.tolist())
-        return indices
-    
-    def _magnitude_fallback(self, keep_ratio):
-        """Round 0 fallback before any client importance is received."""
+        """
+        FIARSE extraction: select top floor(keep_ratio * N) neurons
+        per layer, ranked by mean absolute weight magnitude of the
+        current global model.
+
+        This mirrors the paper's server-side extraction (Algorithm 1, Line 3):
+          θ_i = TopK_γi(|x̃_t|)
+          Send {x̃_t ⊙ M^(i)_t(x̃_t)} to client i
+
+        Adapted from per-parameter to per-neuron granularity.
+        """
         indices = {}
         for name, n_neurons in self.prunable_layers:
             param = dict(self.global_model.named_parameters())[name]
-            if param.dim() == 4:
-                mag = param.data.view(n_neurons, -1).abs().mean(dim=1)
-            else:
-                mag = param.data.abs().mean(dim=1)
-            n_keep = max(1, int(n_neurons * keep_ratio))
-            top_idx = torch.argsort(mag, descending=True)[:n_keep].cpu().tolist()
-            indices[name] = sorted(top_idx)
-        return indices
-    
-    # -----------------------------------------------------------------
-    # Aggregation override: extract + aggregate client importance
-    # -----------------------------------------------------------------
-    
-    def aggregate(self, updates):
-        """
-        Standard partial aggregation + extract and EMA-aggregate
-        client-reported importance scores.
-        """
-        # Extract client importance from uploads before aggregation
-        client_importances = []
-        for update in updates:
-            ci = update.get("metrics", {}).get("client_importance")
-            if ci is not None:
-                # Convert tensors to numpy if needed
-                ci_np = {}
-                for name, imp in ci.items():
-                    if hasattr(imp, 'cpu'):
-                        ci_np[name] = imp.cpu().numpy()
-                    elif isinstance(imp, np.ndarray):
-                        ci_np[name] = imp
-                    else:
-                        ci_np[name] = np.array(imp)
-                client_importances.append(ci_np)
-        
-        # Run standard partial aggregation from base class
-        result = super().aggregate(updates)
-        
-        # Aggregate client importances via EMA
-        if client_importances:
-            self._aggregate_importance(client_importances)
-            logger.info(
-                f"  FIARSE: Aggregated importance from {len(client_importances)} clients"
-            )
-        else:
-            logger.warning("  FIARSE: No client importance received this round")
-        
-        return result
-    
-    def _aggregate_importance(self, client_importances):
-        """EMA update of aggregated client importance."""
-        for name, _ in self.prunable_layers:
-            # Collect importances from clients that reported this layer
-            layer_imps = [ci[name] for ci in client_importances if name in ci]
-            if not layer_imps:
-                continue
-            
-            fresh = np.mean(layer_imps, axis=0)
-            
-            if not self.importance_initialized or self.importance[name] is None:
-                self.importance[name] = fresh
-            else:
-                self.importance[name] = (
-                    self.ema_decay * self.importance[name] +
-                    (1 - self.ema_decay) * fresh
-                )
-        
-        self.importance_initialized = True
 
-    def get_payload_for_client(self, client_id, model_state_dict):
-        """
-        FIARSE override: always send FULL model.
-        
-        FIARSE clients need the complete model for gradient-based importance
-        computation (full forward+backward pass on all neurons). This is the
-        method's fundamental cost — and what makes it communication-expensive
-        compared to FedPrune.
-        """
-        indices = self.round_indices.get(client_id)
-        
-        if indices is None:
-            keep_ratio = self._get_capacity(client_id)
-            indices = self._compute_indices_for_client(
-                client_id, keep_ratio, self.current_round)
-            if 'fc3.weight' in self.layer_sizes and 'fc3.weight' not in indices:
-                indices['fc3.weight'] = list(range(self.layer_sizes['fc3.weight']))
-            self.round_indices[client_id] = indices
-        
-        clean_indices = {k: list(v) for k, v in indices.items()}
-        
-        full_size = sum(v.numel() * 4 for v in model_state_dict.values())
-        logger.info(
-            f"  FIARSE: {client_id} payload {full_size/1024:.1f}KB "
-            f"(FULL MODEL — required for importance computation)"
-        )
-        
-        return {
-            "model_state": model_state_dict,    # FULL — not extracted
-            "extra_payload": clean_indices,
-            "is_submodel": False,               # Client loads directly
-        }
+            # Per-neuron magnitude: mean |weight| across all connections
+            if param.dim() == 4:  # Conv: [out_ch, in_ch, H, W]
+                mag = param.data.abs().view(n_neurons, -1).mean(dim=1)
+            elif param.dim() == 2:  # Linear: [out, in]
+                mag = param.data.abs().mean(dim=1)
+            else:
+                mag = param.data.abs()
+
+            n_keep = max(1, int(n_neurons * keep_ratio))
+            top_idx = torch.argsort(mag, descending=True)[:n_keep]
+            indices[name] = sorted(top_idx.cpu().tolist())
+
+        return indices
+
+    # -----------------------------------------------------------------
+    # No get_payload_for_client override needed.
+    #
+    # The OLD (wrong) implementation overrode this to always send the
+    # FULL model because clients needed it for gradient-based importance.
+    # The CORRECTED FIARSE uses the base class behavior (compact submodel
+    # when enabled, full model when not). FIARSE clients only need their
+    # assigned neurons — TCB-GD operates within the submodel.
+    # -----------------------------------------------------------------
+
+    # -----------------------------------------------------------------
+    # No special aggregation needed — base partial averaging is correct
+    # (Paper Section 4.2, Line 13: standard partial averaging)
+    # -----------------------------------------------------------------

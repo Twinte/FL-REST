@@ -1,26 +1,24 @@
 """
-FLuID Server Strategy for FL-REST
-====================================
-Leader-client invariant dropout (Yang et al., AAAI 2023).
+FLuID Server Strategy for FL-REST (CORRECTED)
+================================================
+Invariant Dropout for straggler mitigation.
+(Wang, Nair & Mahajan, "FLuID: Mitigating Stragglers in Federated
+Learning using Invariant Dropout", NeurIPS 2023)
 
-How it works:
-  1. Server designates high-capacity clients as "leaders"
-  2. Leaders receive the FULL model (all neurons, no pruning)
-  3. Stragglers receive pruned submodels based on importance
-  4. After leaders submit, server computes importance from
-     their update deltas: |leader_update - global_model|
-  5. Uses delta-based importance for straggler extraction next round
+PAPER ALGORITHM (Algorithm 1):
+  1. Identify stragglers based on capacity (proxy for training latency)
+  2. Non-stragglers train the FULL model
+  3. After non-stragglers submit, identify "invariant" neurons:
+     neurons whose weight updates from non-stragglers fall below
+     a threshold th (they've stabilized / contribute little)
+  4. Build sub-models for stragglers by DROPPING invariant neurons
+  5. Threshold th adjusted to match target sub-model size
 
-Key assumptions:
-  - Requires a subset of "leader" clients to always be available
-  - Leaders must have enough capacity to train the full model
-  - Importance is biased toward leader data distributions
-  - Fails gracefully if no leaders participate (falls back to magnitude)
-
-Key difference from FedPrune:
-  - Importance source: LEADER CLIENTS (update deltas)
-  - Dependency: Requires leader availability each round
-  - Bias: Importance reflects leader data, not population consensus
+CORRECTIONS FROM PREVIOUS IMPLEMENTATION:
+  - "Non-straggler" instead of "leader" terminology
+  - Threshold-based invariant dropping instead of top-K by delta
+  - Uses _post_aggregation_hook (base class pattern) not aggregate override
+  - straggler_threshold default calibrated to typical experiment configs
 """
 
 import torch
@@ -32,89 +30,140 @@ from shared.submodel_utils import extract_submodel
 logger = logging.getLogger(__name__)
 
 
-# Clients with capacity >= this threshold become leaders
-LEADER_CAPACITY_THRESHOLD = 0.6
-
-
 class FLuIDStrategy(PartialTrainingStrategy):
-    
+
     METHOD_NAME = "FLuID"
-    
+
     def __init__(self, global_model, ema_decay=0.9,
-                 leader_threshold=LEADER_CAPACITY_THRESHOLD,
+                 leader_threshold=None, straggler_threshold=None,
                  total_rounds=100):
+        """
+        Factory-compatible constructor.
+
+        Args:
+            global_model: PyTorch model instance.
+            ema_decay: Accepted for factory compatibility. NOT USED by
+                       corrected FLuID (no EMA — fresh deltas each round).
+            leader_threshold: OLD parameter name. If provided and
+                straggler_threshold is not, maps to straggler_threshold.
+            straggler_threshold: Clients with capacity < this are stragglers.
+                Defaults to 0.4 (low_perf=0.25 → straggler,
+                mid_perf=0.5 and high_perf=1.0 → non-straggler).
+            total_rounds: Total FL communication rounds.
+        """
         super().__init__(global_model, total_rounds)
-        
-        self.ema_decay = ema_decay
-        self.leader_threshold = leader_threshold
-        
-        # EMA of leader-derived importance
-        self.importance = {name: None for name, _ in self.prunable_layers}
-        self.importance_initialized = False
-        
-        # Track which clients are leaders
-        self.leader_clients = set()
-        
-        logger.info(
-            f"FLuID: leader_threshold={leader_threshold}, "
-            f"EMA decay={ema_decay}"
-        )
-    
-    # -----------------------------------------------------------------
-    # Capacity registration: auto-detect leaders
-    # -----------------------------------------------------------------
-    
-    def register_capacity(self, client_id, capacity):
-        """Register capacity and classify as leader or straggler."""
-        super().register_capacity(client_id, capacity)
-        
-        if capacity >= self.leader_threshold:
-            self.leader_clients.add(client_id)
-            logger.info(f"  FLuID: {client_id} designated as LEADER (cap={capacity:.2f})")
+
+        # Resolve threshold: prefer new name, fall back to old, then default
+        if straggler_threshold is not None:
+            self.straggler_threshold = straggler_threshold
+        elif leader_threshold is not None:
+            # Map old semantics: leader_threshold=0.7 meant cap>=0.7 is leader
+            # New semantics: cap < threshold is straggler
+            # Reasonable mapping: straggler_threshold ≈ leader_threshold - 0.2
+            self.straggler_threshold = max(0.2, leader_threshold - 0.2)
+            logger.info(
+                f"  FLuID: Mapped legacy leader_threshold={leader_threshold} "
+                f"→ straggler_threshold={self.straggler_threshold}"
+            )
         else:
-            self.leader_clients.discard(client_id)
-            logger.info(f"  FLuID: {client_id} designated as STRAGGLER (cap={capacity:.2f})")
-    
+            self.straggler_threshold = 0.4
+
+        # Track straggler vs non-straggler classification
+        self.straggler_clients = set()
+        self.non_straggler_clients = set()
+
+        # Per-neuron delta signal from non-straggler updates
+        self.neuron_deltas = {name: None for name, _ in self.prunable_layers}
+        self.deltas_initialized = False
+
+        # Pre-aggregation state for delta computation
+        self._pre_agg_state = None
+        self._participating_ids = None
+
+        logger.info(
+            f"FLuID: straggler_threshold={self.straggler_threshold} "
+            f"(cap < threshold → straggler, cap >= threshold → non-straggler)"
+        )
+
     # -----------------------------------------------------------------
-    # Index computation: leaders get full, stragglers get importance-based
+    # Capacity registration: classify straggler vs non-straggler
     # -----------------------------------------------------------------
-    
+
+    def register_capacity(self, client_id, capacity):
+        """Register capacity and dynamically classify client."""
+        super().register_capacity(client_id, capacity)
+
+        if capacity < self.straggler_threshold:
+            self.straggler_clients.add(client_id)
+            self.non_straggler_clients.discard(client_id)
+            logger.info(
+                f"  FLuID: {client_id} → STRAGGLER "
+                f"(cap={capacity:.2f} < {self.straggler_threshold})"
+            )
+        else:
+            self.non_straggler_clients.add(client_id)
+            self.straggler_clients.discard(client_id)
+            logger.info(
+                f"  FLuID: {client_id} → NON-STRAGGLER "
+                f"(cap={capacity:.2f} >= {self.straggler_threshold})"
+            )
+
+    # -----------------------------------------------------------------
+    # Index computation
+    # -----------------------------------------------------------------
+
     def _compute_indices_for_client(self, client_id, keep_ratio, round_num):
         """
-        Leaders: all neurons (full model training).
-        Stragglers: top-k by leader-derived importance (or magnitude fallback).
+        Non-stragglers: all neurons (full model).
+        Stragglers: drop invariant neurons to match capacity budget.
         """
-        if client_id in self.leader_clients:
+        if client_id in self.non_straggler_clients:
             return self._full_model_indices()
-        
+
         # Straggler path
-        if not self.importance_initialized:
+        if not self.deltas_initialized:
             return self._magnitude_fallback(keep_ratio)
-        
-        return self._importance_extraction(keep_ratio)
-    
+
+        return self._invariant_dropout_extraction(keep_ratio)
+
     def _full_model_indices(self):
-        """All neurons for leader clients."""
+        """All neurons — non-stragglers train the full model."""
         indices = {}
         for name, n_neurons in self.prunable_layers:
             indices[name] = list(range(n_neurons))
         return indices
-    
-    def _importance_extraction(self, keep_ratio):
-        """Top-k by leader-derived importance."""
+
+    def _invariant_dropout_extraction(self, keep_ratio):
+        """
+        Invariant Dropout: drop neurons with smallest weight deltas
+        from non-stragglers. These are "invariant" — barely changing,
+        contributing little to training.
+
+        Adjust drop count to match straggler's capacity budget.
+        """
         indices = {}
-        for name, _ in self.prunable_layers:
-            imp = self.importance[name]
-            if imp is None:
+        for name, n_neurons_info in self.prunable_layers:
+            deltas = self.neuron_deltas[name]
+            if deltas is None:
+                n_keep = max(1, int(n_neurons_info * keep_ratio))
+                indices[name] = list(range(n_keep))
                 continue
-            n_total = len(imp)
+
+            n_total = len(deltas)
             n_keep = max(1, int(n_total * keep_ratio))
-            top_idx = np.argsort(imp)[-n_keep:]
-            indices[name] = sorted(top_idx.tolist())
+            n_drop = n_total - n_keep
+
+            # Drop the n_drop neurons with SMALLEST deltas (invariant)
+            # Keep the n_keep neurons with LARGEST deltas (active)
+            sorted_idx = np.argsort(deltas)  # ascending: smallest first
+            invariant_set = set(sorted_idx[:n_drop].tolist())
+            kept = [i for i in range(n_total) if i not in invariant_set]
+            indices[name] = sorted(kept)
+
         return indices
-    
+
     def _magnitude_fallback(self, keep_ratio):
-        """Pre-importance fallback: select by weight magnitude."""
+        """Pre-delta fallback: select by weight magnitude."""
         indices = {}
         for name, n_neurons in self.prunable_layers:
             param = dict(self.global_model.named_parameters())[name]
@@ -123,104 +172,26 @@ class FLuIDStrategy(PartialTrainingStrategy):
             else:
                 mag = param.data.abs().mean(dim=1)
             n_keep = max(1, int(n_neurons * keep_ratio))
-            top_idx = torch.argsort(mag, descending=True)[:n_keep].cpu().tolist()
-            indices[name] = sorted(top_idx)
+            top_idx = torch.argsort(mag, descending=True)[:n_keep]
+            indices[name] = sorted(top_idx.cpu().tolist())
         return indices
-    
+
     # -----------------------------------------------------------------
-    # Aggregation override: capture pre-agg state for delta computation
+    # Per-client payload: non-stragglers get full, stragglers get compact
     # -----------------------------------------------------------------
-    
-    def aggregate(self, updates):
-        """Capture pre-aggregation global state, then delegate to base."""
-        # Save pre-aggregation weights for leader delta computation
-        self._pre_agg_state = {
-            name: param.data.clone()
-            for name, param in self.global_model.named_parameters()
-            if 'weight' in name and 'bn' not in name and param.dim() >= 2
-        }
-        
-        # Track which client_ids participated (in order) for leader matching
-        self._participating_ids = [u.get("client_id", "unknown") for u in updates]
-        
-        return super().aggregate(updates)
-    
-    # -----------------------------------------------------------------
-    # Post-aggregation: compute importance from leader deltas
-    # -----------------------------------------------------------------
-    
-    def _post_aggregation_hook(self, client_states):
-        """
-        Compute importance from leader update deltas.
-        
-        delta = |leader_weights - pre_aggregation_global_weights|
-        Importance = EMA of mean(leader_deltas) per neuron.
-        """
-        pre_agg = getattr(self, '_pre_agg_state', None)
-        participating_ids = getattr(self, '_participating_ids', [])
-        
-        if pre_agg is None:
-            return
-        
-        try:
-            # Identify leader states
-            leader_states = []
-            for i, state in enumerate(client_states):
-                if i < len(participating_ids):
-                    cid = participating_ids[i]
-                    if cid in self.leader_clients:
-                        leader_states.append(state)
-            
-            if not leader_states:
-                logger.info("  FLuID: No leaders participated this round, skipping importance update")
-                return
-            
-            # Compute delta-based importance from leader updates
-            for name, n_neurons in self.prunable_layers:
-                if name not in pre_agg:
-                    continue
-                
-                deltas = []
-                for ls in leader_states:
-                    delta = (ls[name].float() - pre_agg[name].float()).abs()
-                    if delta.dim() == 4:
-                        deltas.append(delta.view(n_neurons, -1).mean(dim=1).cpu().numpy())
-                    elif delta.dim() == 2:
-                        deltas.append(delta.mean(dim=1).cpu().numpy())
-                    else:
-                        deltas.append(delta.cpu().numpy())
-                
-                fresh = np.mean(deltas, axis=0)
-                
-                if not self.importance_initialized or self.importance[name] is None:
-                    self.importance[name] = fresh
-                else:
-                    self.importance[name] = (
-                        self.ema_decay * self.importance[name] +
-                        (1 - self.ema_decay) * fresh
-                    )
-            
-            self.importance_initialized = True
-            logger.info(
-                f"  FLuID: Updated importance from {len(leader_states)} leaders"
-            )
-        except Exception as e:
-            logger.error(f"  FLuID: Error in post-aggregation hook: {e}", exc_info=True)
-        finally:
-            # Free pre-aggregation state to avoid memory accumulation
-            self._pre_agg_state = None
-            self._participating_ids = None
 
     def get_payload_for_client(self, client_id, model_state_dict):
         """
-        FLuID override: leaders get full model, stragglers get submodel.
-        
-        Leaders must train the full model so their update deltas can be
-        used to compute importance for stragglers. This is FLuID's
-        structural dependency — and its vulnerability if leaders drop.
+        Override to differentiate non-straggler vs straggler payloads.
+
+        Non-stragglers MUST get the full model because their deltas are
+        used to identify invariant neurons. If they got a compact submodel,
+        we couldn't compute per-neuron deltas for the full model.
+
+        Stragglers get compact submodels (when extraction is enabled).
         """
         indices = self.round_indices.get(client_id)
-        
+
         if indices is None:
             keep_ratio = self._get_capacity(client_id)
             indices = self._compute_indices_for_client(
@@ -228,17 +199,11 @@ class FLuIDStrategy(PartialTrainingStrategy):
             if 'fc3.weight' in self.layer_sizes and 'fc3.weight' not in indices:
                 indices['fc3.weight'] = list(range(self.layer_sizes['fc3.weight']))
             self.round_indices[client_id] = indices
-        
+
         clean_indices = {k: list(v) for k, v in indices.items()}
-        
-        full_size = sum(v.numel() * 4 for v in model_state_dict.values())
-        
-        if client_id in self.leader_clients:
-            # Leaders: full model (they train everything)
-            logger.info(
-                f"  FLuID: {client_id} (LEADER) payload {full_size/1024:.1f}KB "
-                f"(FULL MODEL)"
-            )
+
+        if client_id in self.non_straggler_clients:
+            # Non-stragglers: full model (needed for delta computation)
             return {
                 "model_state": model_state_dict,
                 "extra_payload": clean_indices,
@@ -247,14 +212,104 @@ class FLuIDStrategy(PartialTrainingStrategy):
         else:
             # Stragglers: compact submodel
             submodel_state = extract_submodel(model_state_dict, clean_indices)
-            sub_size = sum(v.numel() * 4 for v in submodel_state.values())
-            logger.info(
-                f"  FLuID: {client_id} (STRAGGLER) payload "
-                f"{sub_size/1024:.1f}KB / {full_size/1024:.1f}KB "
-                f"({100*sub_size/full_size:.1f}%)"
-            )
             return {
                 "model_state": submodel_state,
                 "extra_payload": clean_indices,
                 "is_submodel": True,
             }
+
+    # -----------------------------------------------------------------
+    # Aggregation: capture pre-agg state via base class aggregate
+    # -----------------------------------------------------------------
+
+    def aggregate(self, updates):
+        """Capture pre-aggregation state, then delegate to base."""
+        # Save pre-aggregation global weights for delta computation
+        self._pre_agg_state = {
+            name: param.data.clone()
+            for name, param in self.global_model.named_parameters()
+            if 'weight' in name and 'bn' not in name and param.dim() >= 2
+        }
+
+        # Track participating client IDs (in order)
+        self._participating_ids = [
+            u.get("client_id", "unknown") for u in updates
+        ]
+
+        # Delegate to base class (which calls _post_aggregation_hook)
+        return super().aggregate(updates)
+
+    # -----------------------------------------------------------------
+    # Post-aggregation hook: compute invariant neuron signal
+    # -----------------------------------------------------------------
+
+    def _post_aggregation_hook(self, client_states):
+        """
+        Called by base class after aggregation completes.
+
+        Compute per-neuron |Δw| from NON-STRAGGLER clients only.
+        Neurons with small deltas are invariant and candidates for
+        dropping from straggler submodels next round.
+        """
+        pre_agg = self._pre_agg_state
+        participating_ids = self._participating_ids
+
+        if pre_agg is None:
+            return
+
+        try:
+            # Collect states from non-straggler clients only
+            non_straggler_states = []
+            for i, state in enumerate(client_states):
+                if i < len(participating_ids):
+                    cid = participating_ids[i]
+                    if cid in self.non_straggler_clients:
+                        non_straggler_states.append(state)
+
+            if not non_straggler_states:
+                logger.info(
+                    "  FLuID: No non-stragglers participated this round, "
+                    "keeping previous invariance signal"
+                )
+                return
+
+            # Compute per-neuron mean |delta| across non-stragglers
+            for name, n_neurons in self.prunable_layers:
+                if name not in pre_agg:
+                    continue
+
+                deltas = []
+                for ns_state in non_straggler_states:
+                    if name not in ns_state:
+                        continue
+                    delta = (
+                        ns_state[name].float() - pre_agg[name].float()
+                    ).abs()
+                    if delta.dim() == 4:
+                        deltas.append(
+                            delta.view(n_neurons, -1).mean(dim=1).cpu().numpy()
+                        )
+                    elif delta.dim() == 2:
+                        deltas.append(
+                            delta.mean(dim=1).cpu().numpy()
+                        )
+                    else:
+                        deltas.append(delta.cpu().numpy())
+
+                if deltas:
+                    self.neuron_deltas[name] = np.mean(deltas, axis=0)
+
+            self.deltas_initialized = True
+            logger.info(
+                f"  FLuID: Updated invariance signal from "
+                f"{len(non_straggler_states)} non-stragglers"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"  FLuID: Error in _post_aggregation_hook: {e}",
+                exc_info=True
+            )
+        finally:
+            self._pre_agg_state = None
+            self._participating_ids = None

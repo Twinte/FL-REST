@@ -1,20 +1,21 @@
 """
-FIARSE Client Algorithm for FL-REST
-=====================================
-Client-side gradient-based importance estimation
-(Anonymous, "FIARSE: Model-Heterogeneous FL via Importance-Aware
-Submodel Extraction", NeurIPS 2024)
+FIARSE Client Algorithm for FL-REST (CORRECTED)
+==================================================
+Threshold-Controlled Biased Gradient Descent (TCB-GD).
+(Wu et al., NeurIPS 2024)
 
-Protocol:
-  1. Receive model + neuron indices from server
-  2. Compute grad x weight importance on local data (EXTRA COST)
-  3. Train with gradient masking (same as other partial-training methods)
-  4. Upload model update + importance scores
+PAPER ALGORITHM (Algorithm 1, Lines 4-11):
+  1. Receive submodel from server
+  2. For K local iterations, apply TCB-GD (Equation 3):
+     g = ∇F_i(x ⊙ M(x)) ⊙ M(x) ⊙ (1 + 2|x|θ / (|x|+θ)²)
+  3. Send delta back to server
 
-The importance computation is the key differentiator and extra burden:
-  - Requires a full-model forward+backward pass on local data
-  - This is the "weak client paradox" -- devices too weak for full
-    training must still run full-model gradient computation
+KEY PROPERTIES:
+  - Threshold-controlled: only parameters ≥ threshold are updated.
+  - Biased: the bias term accelerates separation of important vs
+    unimportant parameters near the threshold boundary.
+  - No separate importance computation — zero extra client overhead.
+  - Mask can dynamically shrink as parameters drop below threshold.
 """
 
 import torch
@@ -29,50 +30,67 @@ logger = logging.getLogger(__name__)
 
 class FIARSEClient(ClientAlgorithm):
     """
-    FIARSE: computes client-side importance then trains with masking.
-    
-    The importance dict is returned in the training result under
-    key "client_importance" -- the existing tensor_metrics pipeline
-    in client/app.py automatically sends it to the server.
+    FIARSE: Trains with Threshold-Controlled Biased Gradient Descent.
     """
-    
+
     def __init__(self, importance_batches=5):
-        self.importance_batches = importance_batches
-    
+        """
+        Args:
+            importance_batches: Accepted for factory compatibility but NOT USED.
+                The old (wrong) implementation used this for gradient-based
+                importance computation. Real FIARSE has no separate importance
+                step — TCB-GD IS the training algorithm.
+        """
+        # importance_batches intentionally unused
+        pass
+
     def train(self, model, dataloader, device, epochs, global_c=None):
         """
-        1. Compute importance (extra forward+backward pass)
-        2. Train with gradient masking
-        3. Return model update + importance scores
+        TCB-GD training with threshold-controlled biased gradients.
+
+        Args:
+            model: PyTorch model (full or submodel-loaded).
+            dataloader: Client's local data.
+            device: torch device.
+            epochs: Number of local training epochs.
+            global_c: Neuron indices dict from server.
+                      Format: {layer_name: [int, int, ...]}
+
+        Returns:
+            dict: Training metrics. NO client_importance field.
         """
         neuron_indices = global_c
-        
         model.to(device)
-        
-        # ============================================================
-        # STEP 1: Compute grad x weight importance (FIARSE extra cost)
-        # ============================================================
-        client_importance = self._compute_importance(model, dataloader, device)
-        
-        logger.info(
-            f"FIARSE: Computed importance for "
-            f"{sum(len(v) for v in client_importance.values())} neurons "
-            f"across {len(client_importance)} layers "
-            f"({self.importance_batches} batches)"
-        )
-        
-        # ============================================================
-        # STEP 2: Train with gradient masking (identical to others)
-        # ============================================================
         model.train()
-        
+
         optimizer = optim.SGD(
             model.parameters(),
             lr=config.LEARNING_RATE,
             momentum=config.MOMENTUM
         )
         criterion = nn.CrossEntropyLoss()
-        
+
+        # ---------------------------------------------------------
+        # Compute per-neuron threshold θ for TCB-GD bias term.
+        # θ = magnitude of the smallest assigned neuron in each layer
+        # (approximates TopK_γ threshold from the paper)
+        # ---------------------------------------------------------
+        thresholds = {}
+        if neuron_indices is not None:
+            for name, param in model.named_parameters():
+                if name in neuron_indices and param.dim() >= 2:
+                    idx_list = neuron_indices[name]
+                    if isinstance(idx_list, torch.Tensor):
+                        idx_list = idx_list.tolist()
+                    if param.dim() == 4:
+                        neuron_mags = param.data.abs().view(
+                            param.size(0), -1).mean(dim=1)
+                    else:
+                        neuron_mags = param.data.abs().mean(dim=1)
+                    assigned_mags = neuron_mags[idx_list]
+                    thresholds[name] = assigned_mags.min().item()
+
+        # Build neuron-level masks for gradient masking
         masks = {}
         if neuron_indices is not None:
             for name, param in model.named_parameters():
@@ -84,93 +102,87 @@ class FIARSEClient(ClientAlgorithm):
                     for idx in idx_list:
                         mask[idx] = 1.0
                     masks[name] = mask
-            
+
             total_assigned = sum(len(v) for v in neuron_indices.values())
             logger.info(
-                f"FIARSE: Training {total_assigned} neurons across "
+                f"FIARSE-TCB: Training {total_assigned} neurons across "
                 f"{len(neuron_indices)} layers"
             )
         else:
-            logger.warning("FIARSE: No neuron indices -- training full model")
-        
+            logger.warning("FIARSE-TCB: No neuron indices — training full model")
+
         total_loss = 0.0
         total_batches = 0
-        
+
         for epoch in range(epochs):
             for data, labels in dataloader:
                 data, labels = data.to(device), labels.to(device)
-                
+
                 optimizer.zero_grad()
                 outputs = model(data)
                 loss = criterion(outputs, labels)
                 loss.backward()
-                
+
+                # ---------------------------------------------------
+                # Apply TCB-GD: mask + bias term (Equation 3)
+                #
+                # g = ∇F(x ⊙ M) ⊙ M ⊙ (1 + 2|x|θ / (|x| + θ)²)
+                # ---------------------------------------------------
                 for name, param in model.named_parameters():
                     if name in masks and param.grad is not None:
+                        # Step 1: Apply neuron mask (threshold-controlled)
+                        m = masks[name]
                         if param.dim() == 4:
-                            param.grad *= masks[name].view(-1, 1, 1, 1)
+                            shaped_mask = m.view(-1, 1, 1, 1)
                         elif param.dim() == 2:
-                            param.grad *= masks[name].view(-1, 1)
-                        elif param.dim() == 1:
-                            param.grad *= masks[name]
-                
+                            shaped_mask = m.view(-1, 1)
+                        else:
+                            shaped_mask = m
+
+                        param.grad *= shaped_mask
+
+                        # Step 2: Apply TCB-GD bias term per-parameter
+                        if name in thresholds:
+                            theta = thresholds[name]
+                            if theta > 0:
+                                abs_w = param.data.abs()
+                                bias = 1.0 + (2.0 * abs_w * theta) / (
+                                    (abs_w + theta) ** 2 + 1e-10
+                                )
+                                param.grad *= bias
+
                 optimizer.step()
-                
+
+                # ---------------------------------------------------
+                # Dynamic mask shrinkage: neurons that dropped below
+                # threshold get masked out (paper Section 4.1)
+                # Check periodically to avoid per-batch overhead.
+                # ---------------------------------------------------
+                if neuron_indices is not None and total_batches % 50 == 0:
+                    for name, param in model.named_parameters():
+                        if name in masks and name in thresholds:
+                            theta = thresholds[name]
+                            if param.dim() == 4:
+                                neuron_mags = param.data.abs().view(
+                                    param.size(0), -1).mean(dim=1)
+                            elif param.dim() == 2:
+                                neuron_mags = param.data.abs().mean(dim=1)
+                            else:
+                                neuron_mags = param.data.abs()
+                            below = neuron_mags < theta
+                            masks[name] = masks[name] * (~below).float()
+
                 total_loss += loss.item()
                 total_batches += 1
-        
+
         avg_loss = total_loss / max(total_batches, 1)
-        
+
         return {
             "algorithm": "FIARSE",
             "avg_loss": avg_loss,
-            "neurons_trained": sum(len(v) for v in neuron_indices.values()) if neuron_indices else 0,
+            "neurons_trained": sum(
+                len(v) for v in neuron_indices.values()
+            ) if neuron_indices else 0,
             "layers_masked": len(masks),
-            # Picked up by client/app.py tensor_metrics detection,
-            # piggybacked to server alongside the model update
-            "client_importance": client_importance,
+            # NO client_importance — that's the whole point of corrected FIARSE
         }
-    
-    def _compute_importance(self, model, dataloader, device):
-        """
-        Per-neuron importance via |grad x weight| (first-order Taylor).
-        
-        Requires a full-model forward+backward pass over local data.
-        
-        Returns:
-            dict: {layer_name: torch.Tensor of shape [n_neurons]}
-        """
-        model.eval()
-        criterion = nn.CrossEntropyLoss()
-        
-        importance = {}
-        for name, param in model.named_parameters():
-            if 'weight' in name and 'bn' not in name and param.dim() >= 2:
-                importance[name] = torch.zeros(param.size(0), device=device)
-        
-        batch_count = 0
-        for data, target in dataloader:
-            if batch_count >= self.importance_batches:
-                break
-            
-            data, target = data.to(device), target.to(device)
-            model.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            
-            for name, param in model.named_parameters():
-                if name in importance and param.grad is not None:
-                    gw = (param.grad * param.data).abs()
-                    if param.dim() == 4:
-                        importance[name] += gw.view(param.size(0), -1).sum(dim=1)
-                    elif param.dim() == 2:
-                        importance[name] += gw.sum(dim=1)
-            
-            batch_count += 1
-        
-        if batch_count > 0:
-            for name in importance:
-                importance[name] = importance[name] / batch_count
-        
-        return importance

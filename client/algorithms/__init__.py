@@ -12,7 +12,7 @@ def get_client_algorithm(algo_name):
         return FedProx(mu=config.FEDPROX_MU)
     elif algo_name == "Scaffold":
         return Scaffold()
-    
+
     # All partial-training methods share the same client algorithm.
     # The server-side strategy determines WHICH neurons each client trains;
     # the client just receives indices and masks gradients.
@@ -22,16 +22,18 @@ def get_client_algorithm(algo_name):
         return PartialTrainingClient(method_name="HeteroFL")
     elif algo_name == "FedRolex":
         return PartialTrainingClient(method_name="FedRolex")
-    
-    # FIARSE: same gradient masking + extra importance computation on client
+
+    # FIARSE (CORRECTED): TCB-GD training with biased gradients.
+    # No separate importance computation, no importance uploads.
+    # importance_batches accepted for backward compat but unused.
     elif algo_name == "FIARSE":
         return FIARSEClient(importance_batches=5)
-    
-    # FLuID: leaders and followers both use gradient masking.
-    # Leaders receive full neuron indices (no actual masking),
-    # followers receive submodel indices. Same client code either way.
+
+    # FLuID: non-stragglers and stragglers both use gradient masking.
+    # Non-stragglers receive full neuron indices (no actual masking),
+    # stragglers receive submodel indices (invariant neurons dropped).
     elif algo_name == "FLuID":
         return PartialTrainingClient(method_name="FLuID")
-    
+
     else:
         raise ValueError(f"Unknown Client Algorithm: {algo_name}")
